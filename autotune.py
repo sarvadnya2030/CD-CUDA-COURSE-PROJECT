@@ -1,17 +1,26 @@
 """
-autotune.py — main entrypoint for the CUDA kernel auto-tuner.
+autotune.py — main entry point for the CUDA kernel auto-tuner.
 
 Usage:
-    python autotune.py --kernel=matmul --size=1024
-    python autotune.py --kernel=reduction --iters=200
+    python autotune.py --kernel=matmul
+    python autotune.py --kernel=all --strategy=bayesian
+    python autotune.py --kernel=reduction --strategy=sha
     python autotune.py --baseline-only
+    python autotune.py --kernel=softmax --ptx-analysis --cuda-graphs
+    python autotune.py --kernel=matmul --skip-verification --workers=4
 
 Pipeline:
     1. Parse baseline kernel → extract profile + search space
-    2. Generate all variant .cu files
-    3. Compile each with nvcc (parallel jobs)
-    4. Benchmark each → collect mean_ms
-    5. Report best config + speedup over baseline
+    2. Generate variant .cu files (all or via search strategy)
+    3. [Optional] Verify correctness of each variant vs NumPy reference
+    4. Compile each variant with nvcc (parallel)
+    5. Statistical benchmark: 5 warmup + 30 timed runs (CUDA events)
+    6. Welch t-test vs baseline; flag statistically significant wins
+    7. Roofline model: classify memory-bound vs compute-bound
+    8. Occupancy analysis: parse ptxas register/smem output
+    9. [Optional] PTX/SASS analysis (--ptx-analysis)
+   10. [Optional] CUDA Graph overhead measurement (--cuda-graphs)
+   11. Generate Markdown report + print terminal summary table
 """
 
 import argparse
@@ -22,93 +31,72 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
 ROOT        = Path(__file__).parent
 SRC_DIR     = ROOT / "src"
 RESULTS_DIR = ROOT / "results"
 GEN_DIR     = RESULTS_DIR / "generated"
 BINS_DIR    = RESULTS_DIR / "bins"
-GEN_DIR.mkdir(parents=True, exist_ok=True)
-BINS_DIR.mkdir(parents=True, exist_ok=True)
+
+for d in (GEN_DIR, BINS_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(SRC_DIR))
 
 from parser    import KernelProfile, MemoryAccessPattern, build_search_space
 from generator import enumerate_variants, write_variant, ARCH
+from benchmark import (
+    BenchmarkResult, compile_kernel, run_binary, parse_timing_output,
+    run_statistical_benchmark, run_baseline_benchmark,
+    N_WARMUP_DEFAULT, N_SAMPLES_DEFAULT,
+)
+from roofline  import RooflineAnalyzer, get_dims
+from occupancy import OccupancyAnalyzer, parse_ptxas_stderr
+from search    import make_strategy, ConvergenceLogger, GridSearchStrategy
+from reporter  import ReportGenerator, print_terminal_summary, print_final_summary
 
-WARMUP = 5
-ITERS  = 100
+# Optional modules (degrade gracefully)
+try:
+    from verifier import CorrectnessVerifier
+    _VERIFIER_OK = True
+except ImportError:
+    _VERIFIER_OK = False
 
+try:
+    from ptx_analysis import PTXAnalyzer
+    _PTX_OK = True
+except ImportError:
+    _PTX_OK = False
 
-# ── Compilation ─────────────────────────────────────────────────────────────
+try:
+    from cuda_graph import CUDAGraphBenchmark
+    _GRAPH_OK = True
+except ImportError:
+    _GRAPH_OK = False
 
-def compile_variant(src: Path, binary: Path) -> tuple[bool, str]:
-    cmd = [
-        "nvcc", "-O3", f"-arch={ARCH}",
-        "--use_fast_math",
-        str(src), "-o", str(binary),
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0, r.stderr
+# Attention kernel (always-available — pure Python templates)
+try:
+    from attention import (
+        enumerate_attention_variants,
+        write_attention_variant,
+        build_attention_search_space,
+        attention_flops,
+        attention_bytes_flash,
+        SEQ_LEN as ATT_SEQ_LEN,
+        D_HEAD  as ATT_D_HEAD,
+    )
+    _ATTENTION_OK = True
+except ImportError:
+    _ATTENTION_OK = False
 
-
-def run_variant(binary: Path) -> float | None:
-    """Run a compiled benchmark binary, return mean_ms or None on failure."""
-    env = os.environ.copy()
-    env["WARMUP"] = str(WARMUP)
-    env["ITERS"]  = str(ITERS)
-    try:
-        r = subprocess.run([str(binary)], capture_output=True, text=True,
-                           env=env, timeout=120)
-        for line in r.stdout.splitlines():
-            if line.startswith("TIMING"):
-                parts = line.split()
-                return float(parts[2])   # mean_ms
-    except subprocess.TimeoutExpired:
-        pass
-    return None
-
-
-# ── Baseline ─────────────────────────────────────────────────────────────────
-
-def run_baseline() -> dict[str, float]:
-    """Compile and run the baseline runner, return {kernel_name: mean_ms}."""
-    src    = SRC_DIR / "kernels" / "benchmark_runner.cu"
-    binary = BINS_DIR / "baseline_runner"
-
-    print("[COMPILE] baseline_runner.cu ...", end=" ", flush=True)
-    ok, stderr = compile_variant(src, binary)
-    if not ok:
-        print("FAILED\n" + stderr)
-        return {}
-    print("OK")
-
-    env = os.environ.copy()
-    env["WARMUP"] = str(WARMUP)
-    env["ITERS"]  = str(ITERS)
-
-    print(f"[RUN] baseline (warmup={WARMUP}, iters={ITERS}) ...")
-    r = subprocess.run([str(binary)], capture_output=True, text=True,
-                       env=env, timeout=300)
-    print(r.stdout)
-
-    timings = {}
-    for line in r.stdout.splitlines():
-        if line.startswith("TIMING"):
-            parts = line.split()
-            timings[parts[1]] = float(parts[2])
-
-    out = RESULTS_DIR / "baseline.json"
-    with open(out, "w") as f:
-        json.dump(timings, f, indent=2)
-    print(f"[SAVED] {out}\n")
-    return timings
+SUPPORTED_KERNELS = ["matmul", "softmax", "reduction", "layernorm", "attention"]
 
 
-# ── Auto-tuning ──────────────────────────────────────────────────────────────
+# ── Kernel profile builder ─────────────────────────────────────────────────
 
 def build_kernel_profile(kernel: str) -> KernelProfile:
-    """Build a representative profile for the given kernel name."""
+    """Return a KernelProfile for the given kernel name."""
     memory = MemoryAccessPattern(
         has_global_load    = True,
         has_global_store   = True,
@@ -127,8 +115,134 @@ def build_kernel_profile(kernel: str) -> KernelProfile:
     )
 
 
-def autotune_kernel(kernel: str, baseline_ms: float | None,
-                    max_workers: int = 4) -> dict:
+# ── Compilation ────────────────────────────────────────────────────────────
+
+def compile_variant(src: Path, binary: Path) -> tuple[bool, str]:
+    """Compile a variant .cu with nvcc, capturing ptxas info."""
+    cmd = [
+        "nvcc", "-O3", f"-arch={ARCH}",
+        "--use_fast_math",
+        "-Xptxas", "-v",
+        str(src), "-o", str(binary),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode == 0, r.stderr
+
+
+# ── Per-variant processing ─────────────────────────────────────────────────
+
+def process_variant(
+    kernel: str,
+    params: dict,
+    src_path: Path,
+    baseline_samples: list[float],
+    warmup: int,
+    n_samples: int,
+    roofline: RooflineAnalyzer,
+    occ_analyzer: OccupancyAnalyzer,
+    verifier: Optional[object],
+    graph_bench: Optional[object],
+    skip_verification: bool,
+) -> Optional[BenchmarkResult]:
+    """
+    Compile, (verify), benchmark, and analyse one kernel variant.
+
+    Returns a fully populated BenchmarkResult or None on compile failure.
+    """
+    binary = BINS_DIR / (src_path.stem + ".exe")
+
+    # 1. Compile
+    ok, compile_stderr = compile_variant(src_path, binary)
+    if not ok:
+        return None
+
+    # 2. Correctness verification (always-on unless --skip-verification)
+    if verifier is not None and not skip_verification and _VERIFIER_OK:
+        vr = verifier.check(kernel, src_path, params)
+        if not vr.is_correct:
+            return None   # Skip benchmarking failed variants
+
+    # 3. Statistical benchmark
+    tag = next(iter(parse_timing_output(
+        f"TIMING {src_path.stem}_placeholder 0 0 0 0"
+    ).keys()), src_path.stem)
+    # Use the stem as the variant tag to match SAMPLE lines
+    result = run_statistical_benchmark(
+        binary, src_path.stem,
+        baseline_samples=baseline_samples,
+        warmup=warmup,
+        n_samples=n_samples,
+    )
+    if result is None:
+        return None
+
+    result.params    = params
+    result.kernel    = kernel
+    result.variant   = src_path.stem
+    result.ptx_info  = compile_stderr
+
+    # 4. Roofline analysis
+    dims = get_dims(kernel)
+    result.arithmetic_intensity    = roofline.arithmetic_intensity(kernel, dims)
+    result.achieved_gflops         = roofline.achieved_gflops(kernel, dims, result.mean_ms)
+    result.bound_type              = roofline.bound_type(kernel, dims)
+    result.roofline_efficiency_pct = roofline.efficiency_pct(kernel, dims, result.mean_ms)
+
+    # 5. Occupancy analysis (from ptxas stderr captured during compile)
+    occ_info = occ_analyzer.analyze_from_stderr(
+        compile_stderr,
+        kernel_function=f"{kernel}_opt",
+        block_size=params.get("block_size", 64),
+    )
+    if occ_info:
+        result.occupancy             = occ_info.occupancy
+        result.registers_per_thread  = occ_info.registers_per_thread
+        result.shared_mem_bytes      = occ_info.shared_mem_bytes
+        result.has_register_spill    = occ_info.has_register_spill
+        result.spill_stores          = occ_info.spill_stores
+        result.spill_loads           = occ_info.spill_loads
+
+    # 6. CUDA Graph benchmark (optional)
+    if graph_bench is not None and _GRAPH_OK and graph_bench.available:
+        gr = graph_bench.benchmark(binary, kernel, result.variant, result.mean_ms)
+        if gr is not None:
+            result.graph_launch_ms = gr.graph_mean_ms
+
+    return result
+
+
+# ── Main auto-tuning loop ─────────────────────────────────────────────────
+
+def autotune_kernel(
+    kernel: str,
+    baseline_data: dict,
+    strategy_name: str = "grid",
+    max_workers: int = 2,
+    warmup: int = N_WARMUP_DEFAULT,
+    n_samples: int = N_SAMPLES_DEFAULT,
+    skip_verification: bool = False,
+    run_ptx_analysis: bool = False,
+    run_cuda_graphs: bool = False,
+    matrix_size: int = 1024,
+) -> list[BenchmarkResult]:
+    """
+    Auto-tune one kernel: generate → verify → compile → benchmark → analyse.
+
+    Args:
+        kernel:           Kernel name.
+        baseline_data:    Output of run_baseline_benchmark() for this kernel.
+        strategy_name:    "grid" | "bayesian" | "sha"
+        max_workers:      Parallel compile+benchmark workers.
+        warmup:           Warmup iterations per variant.
+        n_samples:        Statistical samples per variant.
+        skip_verification: If True, skip correctness checking.
+        run_ptx_analysis: If True, generate and analyse PTX.
+        run_cuda_graphs:  If True, add CUDA Graph timing.
+        matrix_size:      Problem size N for matmul; rows for softmax/layernorm.
+
+    Returns:
+        List of BenchmarkResult sorted best-first (lowest mean_ms).
+    """
     profile  = build_kernel_profile(kernel)
     space    = build_search_space(profile)
     variants = enumerate_variants(kernel, space)
@@ -136,116 +250,463 @@ def autotune_kernel(kernel: str, baseline_ms: float | None,
     total = len(variants)
     print(f"\n[GENERATE] {total} variants for '{kernel}' ...")
     for params, src_path in variants:
-        write_variant(kernel, params, src_path)
+        write_variant(kernel, params, src_path, matrix_size=matrix_size)
 
-    print(f"[COMPILE+BENCHMARK] {total} variants "
-          f"(warmup={WARMUP}, iters={ITERS}) — this may take a while ...")
+    # Extract baseline samples for Welch t-test
+    baseline_samples: list[float] = baseline_data.get("samples", [])
+    if not baseline_samples:
+        bms = baseline_data.get("mean_ms")
+        if bms:
+            baseline_samples = [bms]
 
-    results = []
-    done    = 0
-    t0      = time.time()
+    # Instantiate analyzers
+    roofline      = RooflineAnalyzer()
+    occ_analyzer  = OccupancyAnalyzer(arch=ARCH)
+    verifier      = CorrectnessVerifier(verbose=False) if _VERIFIER_OK else None
+    graph_bench   = (CUDAGraphBenchmark() if (run_cuda_graphs and _GRAPH_OK) else None)
+    ptx_analyzer  = (PTXAnalyzer(results_dir=RESULTS_DIR) if run_ptx_analysis else None)
+    conv_logger   = ConvergenceLogger(kernel, RESULTS_DIR)
 
-    def process(item):
+    # Build search strategy
+    strategy = make_strategy(strategy_name, space, kernel=kernel)
+
+    print(f"[STRATEGY] {strategy.name}  "
+          f"warmup={warmup}  samples={n_samples}  workers={max_workers}")
+    if not skip_verification:
+        print(f"[VERIFY] Correctness checking enabled (numpy reference)")
+    else:
+        print(f"[VERIFY] WARNING: correctness verification SKIPPED (--skip-verification)")
+
+    results: list[BenchmarkResult] = []
+    done  = 0
+    t0    = time.time()
+
+    # Live progress JSON path
+    live_progress_path = RESULTS_DIR / "live_progress.json"
+    live_progress_path.write_text(json.dumps({
+        "kernel": kernel, "strategy": strategy_name,
+        "done": 0, "total": total,
+        "best_ms": None, "baseline_ms": baseline_data.get("mean_ms"),
+        "best_speedup": None, "best_params": None, "recent": [],
+    }, indent=2))
+
+    def _process(item: tuple) -> Optional[BenchmarkResult]:
         params, src_path = item
-        binary = BINS_DIR / (src_path.stem + ".exe")
-        ok, _  = compile_variant(src_path, binary)
-        if not ok:
-            return params, None
-        mean_ms = run_variant(binary)
-        return params, mean_ms
+        return process_variant(
+            kernel, params, src_path,
+            baseline_samples, warmup, n_samples,
+            roofline, occ_analyzer, verifier, graph_bench, skip_verification,
+        )
 
+    # All strategies: iterate over all variants (strategy controls ordering)
+    # For grid: enumerate_variants already returns all; no need to re-suggest
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(process, v): v for v in variants}
+        futures = {pool.submit(_process, v): v for v in variants}
         for fut in as_completed(futures):
-            params, mean_ms = fut.result()
+            params, src_path = futures[fut]
             done += 1
             elapsed = time.time() - t0
             eta     = elapsed / done * (total - done)
-            status  = f"{mean_ms:.3f}ms" if mean_ms else "FAIL"
-            print(f"  [{done:3d}/{total}] {status:<12} ETA {eta:.0f}s", end="\r")
-            if mean_ms is not None:
-                results.append({"params": params, "mean_ms": mean_ms})
+            try:
+                result = fut.result()
+            except Exception:
+                result = None
 
-    print()  # newline after \r
+            if result is not None:
+                results.append(result)
+                strategy.update(params, result.mean_ms)
+                conv_logger.record(params, result.mean_ms)
+                status = (f"{result.mean_ms:.3f}ms  "
+                          f"{'✓' if result.is_significant else '·'}")
+            else:
+                status = "FAIL"
+
+            print(f"  [{done:3d}/{total}] {status:<20} ETA {eta:.0f}s", end="\r")
+
+            # Write live progress JSON after every variant
+            best_so_far = min(results, key=lambda r: r.mean_ms) if results else None
+            bms = baseline_data.get("mean_ms")
+            recent = [
+                {"variant": r.variant,
+                 "mean_ms": round(r.mean_ms, 4),
+                 "speedup": round(r.speedup, 3),
+                 "passed": r.is_significant}
+                for r in sorted(results, key=lambda r: r.mean_ms)[:5]
+            ]
+            try:
+                live_progress_path.write_text(json.dumps({
+                    "kernel": kernel, "strategy": strategy_name,
+                    "done": done, "total": total,
+                    "best_ms": round(best_so_far.mean_ms, 4) if best_so_far else None,
+                    "baseline_ms": bms,
+                    "best_speedup": round(best_so_far.speedup, 3) if best_so_far else None,
+                    "best_params": best_so_far.params if best_so_far else None,
+                    "recent": recent,
+                }, indent=2))
+            except Exception:
+                pass  # never let progress writes crash the main loop
+
+    print()  # clear \r line
+
+    # Verifier summary
+    if verifier is not None and not skip_verification:
+        verifier.print_summary()
+        verifier.save_failures(kernel)
+
+    # Sort results best-first
+    results.sort(key=lambda r: r.mean_ms)
 
     if not results:
-        print("[ERROR] No variants compiled successfully.")
-        return {}
+        print(f"[ERROR] No variants compiled+verified+benchmarked successfully.")
+        return []
 
-    results.sort(key=lambda x: x["mean_ms"])
-    best = results[0]
-
+    # Save tuning JSON
+    baseline_ms = baseline_data.get("mean_ms")
     out_path = RESULTS_DIR / f"{kernel}_tuning.json"
     with open(out_path, "w") as f:
-        json.dump({"kernel": kernel, "variants": results,
-                   "best": best, "baseline_ms": baseline_ms}, f, indent=2)
+        json.dump({
+            "kernel":      kernel,
+            "strategy":    strategy_name,
+            "n_variants":  total,
+            "n_results":   len(results),
+            "baseline_ms": baseline_ms,
+            "best":        results[0].to_dict() if results else None,
+            "variants":    [r.to_dict() for r in results[:50]],  # top 50
+        }, f, indent=2)
 
-    speedup = (baseline_ms / best["mean_ms"]) if baseline_ms else None
+    # Save convergence
+    conv_logger.save()
 
-    print(f"\n{'='*60}")
-    print(f"KERNEL:   {kernel}")
-    print(f"BEST:     {best['params']}")
-    print(f"TIME:     {best['mean_ms']:.3f}ms")
-    if speedup:
-        print(f"BASELINE: {baseline_ms:.3f}ms  →  SPEEDUP: {speedup:.2f}x")
-    print(f"RESULTS:  {out_path}")
-    print('='*60)
+    # PTX analysis (optional)
+    if ptx_analyzer and results:
+        best_src = GEN_DIR / (results[0].variant + ".cu")
+        baseline_src = SRC_DIR / "kernels" / "baseline_kernels.cu"
+        if best_src.exists() and baseline_src.exists():
+            b_metrics = ptx_analyzer.analyze_source(baseline_src)
+            o_metrics = ptx_analyzer.analyze_source(best_src)
+            cmp = ptx_analyzer.compare(kernel, b_metrics, o_metrics)
+            ptx_analyzer.save(kernel, cmp)
+            ptx_analyzer.print_comparison(cmp)
 
-    return best
+    # Roofline summary table
+    if baseline_ms and results:
+        dims = get_dims(kernel)
+        roofline.print_summary_table([
+            (kernel, dims, baseline_ms),
+            (kernel, dims, results[0].mean_ms),
+        ], title=f"Roofline — {kernel} (baseline vs best)")
 
+    # Occupancy table
+    occ_rows = [r for r in results[:10] if r.occupancy is not None]
+    if occ_rows:
+        occ_analyzer.print_table(occ_rows, title=f"Occupancy — {kernel} top 10")
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
-
-SUPPORTED_KERNELS = ["matmul", "softmax", "reduction"]
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="CUDA kernel auto-tuner for RTX 2070"
+    # Terminal summary
+    print_terminal_summary(
+        kernel=kernel,
+        results=results,
+        baseline_ms=baseline_ms,
+        n_total=total,
+        strategy=strategy_name,
     )
-    parser.add_argument("--kernel",   choices=SUPPORTED_KERNELS + ["all"],
-                        default="matmul",
-                        help="Which kernel to tune (default: matmul)")
-    parser.add_argument("--baseline-only", action="store_true",
-                        help="Only run baseline benchmarks, skip tuning")
-    parser.add_argument("--workers",  type=int, default=2,
-                        help="Parallel compile+run workers (default: 2)")
-    parser.add_argument("--warmup",   type=int, default=5)
-    parser.add_argument("--iters",    type=int, default=100)
+
+    # Markdown report
+    rg = ReportGenerator(kernel, strategy=strategy_name)
+    rg.set_results(results, baseline_ms)
+    if baseline_ms and results:
+        dims = get_dims(kernel)
+        b_pt = {
+            "arithmetic_intensity": roofline.arithmetic_intensity(kernel, dims),
+            "achieved_gflops":      roofline.achieved_gflops(kernel, dims, baseline_ms),
+            "bound_type":           roofline.bound_type(kernel, dims),
+            "efficiency_pct":       roofline.efficiency_pct(kernel, dims, baseline_ms),
+        }
+        o_pt = {
+            "arithmetic_intensity": results[0].arithmetic_intensity,
+            "achieved_gflops":      results[0].achieved_gflops,
+            "bound_type":           results[0].bound_type,
+            "efficiency_pct":       results[0].roofline_efficiency_pct,
+        }
+        rg.set_roofline_points(b_pt, o_pt)
+    if verifier:
+        rg.set_correctness(
+            n_passed=verifier._n_passed,
+            n_failed=verifier._n_failed,
+            n_checked=verifier._n_checked,
+        )
+    if ptx_analyzer:
+        ptx_path = RESULTS_DIR / f"{kernel}_ptx_analysis.json"
+        if ptx_path.exists():
+            with open(ptx_path) as f:
+                rg.set_ptx_data(json.load(f))
+    conv_path = RESULTS_DIR / f"{kernel}_convergence.json"
+    if conv_path.exists():
+        with open(conv_path) as f:
+            rg.set_convergence(json.load(f))
+    rg.generate()
+
+    return results
+
+
+# ── Attention auto-tuner ───────────────────────────────────────────────────
+
+def autotune_attention(
+    warmup: int = N_WARMUP_DEFAULT,
+    n_samples: int = N_SAMPLES_DEFAULT,
+) -> list[BenchmarkResult]:
+    """
+    Auto-tune all attention variants (Tiled + Flash × seq_tile × unroll).
+    Writes results/attention_tuning.json and updates live_progress.json.
+    """
+    if not _ATTENTION_OK:
+        print("[ATTENTION] attention.py not importable — skipping.")
+        return []
+
+    variants = enumerate_attention_variants()
+    total    = len(variants)
+    print(f"\n[ATTENTION] {total} variants (Tiled + Flash variants) ...")
+
+    for params, src_path in variants:
+        write_attention_variant(params, src_path)
+
+    live_progress_path = RESULTS_DIR / "live_progress.json"
+    live_progress_path.write_text(json.dumps({
+        "kernel": "attention", "strategy": "grid",
+        "done": 0, "total": total,
+        "best_ms": None, "baseline_ms": None,
+        "best_speedup": None, "best_params": None, "recent": [],
+    }, indent=2))
+
+    roofline     = RooflineAnalyzer()
+    occ_analyzer = OccupancyAnalyzer(arch=ARCH)
+
+    results: list[BenchmarkResult] = []
+    done = 0
+    t0   = time.time()
+
+    for params, src_path in variants:
+        binary = BINS_DIR / (src_path.stem + ".exe")
+        ok, compile_stderr = compile_variant(src_path, binary)
+        done += 1
+        if not ok:
+            print(f"  [{done:3d}/{total}] COMPILE FAIL", end="\r")
+            continue
+
+        result = run_statistical_benchmark(
+            binary, src_path.stem,
+            baseline_samples=[],
+            warmup=warmup,
+            n_samples=n_samples,
+        )
+        if result is None:
+            continue
+
+        result.params  = params
+        result.kernel  = "attention"
+        result.variant = src_path.stem
+        result.ptx_info = compile_stderr
+
+        # Roofline for attention (no get_dims integration — use attention model)
+        s, d = ATT_SEQ_LEN, ATT_D_HEAD
+        flops = attention_flops(s, d)
+        byt   = attention_bytes_flash(s, d) if params.get("flash") else int((3*s*d + 2*s*s + s*d)*4)
+        result.arithmetic_intensity    = flops / byt if byt else 0
+        result.achieved_gflops         = (flops / 1e9) / (result.mean_ms / 1000) if result.mean_ms else 0
+        peak = 7500  # RTX 2070 FP32 GFLOP/s
+        result.bound_type              = "compute" if result.arithmetic_intensity > 16.74 else "memory"
+        result.roofline_efficiency_pct = (result.achieved_gflops / peak) * 100
+
+        # Occupancy
+        occ_info = occ_analyzer.analyze_from_stderr(
+            compile_stderr,
+            kernel_function="attention_flash" if params.get("flash") else "attention_tiled",
+            block_size=ATT_D_HEAD,
+        )
+        if occ_info:
+            result.occupancy            = occ_info.occupancy
+            result.registers_per_thread = occ_info.registers_per_thread
+            result.shared_mem_bytes     = occ_info.shared_mem_bytes
+
+        results.append(result)
+        elapsed = time.time() - t0
+        print(f"  [{done:3d}/{total}] {result.mean_ms:.3f}ms  ETA {elapsed/done*(total-done):.0f}s", end="\r")
+
+        # Update live progress JSON
+        best_so_far = min(results, key=lambda r: r.mean_ms) if results else None
+        recent = [
+            {"variant": r.variant, "mean_ms": round(r.mean_ms, 4),
+             "passed": True, "flash": r.params.get("flash", False)}
+            for r in sorted(results, key=lambda r: r.mean_ms)[:5]
+        ]
+        try:
+            live_progress_path.write_text(json.dumps({
+                "kernel": "attention", "strategy": "grid",
+                "done": done, "total": total,
+                "best_ms": round(best_so_far.mean_ms, 4) if best_so_far else None,
+                "baseline_ms": None,
+                "best_speedup": round(best_so_far.speedup, 3) if best_so_far else None,
+                "best_params": best_so_far.params if best_so_far else None,
+                "recent": recent,
+            }, indent=2))
+        except Exception:
+            pass
+
+    print()  # clear \r line
+    results.sort(key=lambda r: r.mean_ms)
+
+    if not results:
+        print("[ATTENTION] No variants compiled successfully.")
+        return []
+
+    out_path = RESULTS_DIR / "attention_tuning.json"
+    with open(out_path, "w") as f:
+        json.dump({
+            "kernel": "attention",
+            "strategy": "grid",
+            "n_variants": total,
+            "n_results": len(results),
+            "baseline_ms": None,
+            "best": results[0].to_dict() if results else None,
+            "variants": [r.to_dict() for r in results[:50]],
+        }, f, indent=2)
+
+    best = results[0]
+    variant_type = "Flash" if best.params.get("flash") else "Tiled"
+    print(f"\n[ATTENTION] Best: {best.mean_ms:.3f}ms — {variant_type} "
+          f"seq_tile={best.params.get('seq_tile')} unroll={best.params.get('unroll')}")
+    print(f"[ATTENTION] {best.achieved_gflops:.1f} GFLOP/s  "
+          f"({best.roofline_efficiency_pct:.1f}% of peak)")
+    return results
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="CUDA Kernel Auto-Tuner — RTX 2070 (sm_75)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python autotune.py --kernel=matmul
+  python autotune.py --kernel=all --strategy=bayesian
+  python autotune.py --kernel=reduction --strategy=sha --workers=4
+  python autotune.py --baseline-only
+  python autotune.py --kernel=softmax --ptx-analysis --cuda-graphs
+  python autotune.py --kernel=matmul --skip-verification
+""",
+    )
+    parser.add_argument(
+        "--kernel", choices=SUPPORTED_KERNELS + ["all"], default="matmul",
+        help="Kernel to tune (default: matmul)"
+    )
+    parser.add_argument(
+        "--baseline-only", action="store_true",
+        help="Only run baseline benchmarks, skip tuning"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=2,
+        help="Parallel compile+benchmark workers (default: 2)"
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=N_WARMUP_DEFAULT,
+        help=f"GPU warmup iterations per variant (default: {N_WARMUP_DEFAULT})"
+    )
+    parser.add_argument(
+        "--samples", type=int, default=N_SAMPLES_DEFAULT,
+        help=f"Statistical samples per variant (default: {N_SAMPLES_DEFAULT})"
+    )
+    # Legacy --iters alias
+    parser.add_argument(
+        "--iters", type=int, default=None,
+        help="Alias for --samples (backward compatibility)"
+    )
+    parser.add_argument(
+        "--strategy", choices=["grid", "bayesian", "sha"], default="grid",
+        help="Search strategy: grid | bayesian | sha (default: grid)"
+    )
+    parser.add_argument(
+        "--skip-verification", action="store_true",
+        help="Skip correctness verification (faster, but unsafe)"
+    )
+    parser.add_argument(
+        "--ptx-analysis", action="store_true",
+        help="Enable PTX/SASS instruction analysis (adds compile time)"
+    )
+    parser.add_argument(
+        "--cuda-graphs", action="store_true",
+        help="Measure CUDA Graph launch overhead vs event-based timing"
+    )
+    parser.add_argument(
+        "--matrix-size", type=int, default=1024, choices=[512, 1024, 2048],
+        help="Problem size N for matmul (N×N), rows for softmax/layernorm (default: 1024)"
+    )
+
     args = parser.parse_args()
 
-    global WARMUP, ITERS
-    WARMUP = args.warmup
-    ITERS  = args.iters
+    # --iters is a backward-compat alias for --samples
+    n_samples = args.samples
+    if args.iters is not None:
+        n_samples = args.iters
 
-    print("╔══════════════════════════════════════════╗")
-    print("║  CUDA Kernel Auto-Tuner  |  RTX 2070     ║")
-    print("╚══════════════════════════════════════════╝\n")
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║  CUDA Kernel Auto-Tuner  |  RTX 2070  |  sm_75       ║")
+    print("╚══════════════════════════════════════════════════════╝\n")
 
-    baselines = run_baseline()
+    # Run baseline
+    print("[BASELINE] Compiling and benchmarking naive kernels ...\n")
+    baselines = run_baseline_benchmark(
+        warmup=args.warmup,
+        n_samples=n_samples,
+    )
+
+    if not baselines:
+        print("[ERROR] Baseline benchmark failed. Check CUDA installation.")
+        sys.exit(1)
 
     if args.baseline_only:
+        print("\n[DONE] Baseline only — exiting.")
         return
 
-    kernels = SUPPORTED_KERNELS if args.kernel == "all" else [args.kernel]
+    kernels = ([k for k in SUPPORTED_KERNELS if k != "attention"]
+               if args.kernel == "all"
+               else ([] if args.kernel == "attention"
+                     else [args.kernel]))
 
-    all_results = {}
+    all_results: dict[str, list[BenchmarkResult]] = {}
+
     for k in kernels:
-        # Match baseline key prefix
-        baseline_ms = next(
-            (v for key, v in baselines.items() if key.startswith(k)), None
+        # Find baseline data for this kernel (match by prefix)
+        baseline_data = next(
+            (v for tag, v in baselines.items() if tag.startswith(k)),
+            {}
         )
-        best = autotune_kernel(k, baseline_ms, max_workers=args.workers)
-        all_results[k] = best
 
-    print("\n[DONE] Full summary:")
-    for k, best in all_results.items():
-        baseline_ms = next(
-            (v for key, v in baselines.items() if key.startswith(k)), None
+        results = autotune_kernel(
+            kernel=k,
+            baseline_data=baseline_data,
+            strategy_name=args.strategy,
+            max_workers=args.workers,
+            warmup=args.warmup,
+            n_samples=n_samples,
+            skip_verification=args.skip_verification,
+            run_ptx_analysis=args.ptx_analysis,
+            run_cuda_graphs=args.cuda_graphs,
+            matrix_size=args.matrix_size,
         )
-        if best and baseline_ms:
-            speedup = baseline_ms / best["mean_ms"]
-            print(f"  {k:<12} {baseline_ms:.3f}ms → {best['mean_ms']:.3f}ms  "
-                  f"({speedup:.2f}x speedup)")
+        all_results[k] = results
+
+    # Attention kernel (separate pipeline, no baseline needed)
+    if args.kernel in ("attention", "all"):
+        att_results = autotune_attention(
+            warmup=args.warmup,
+            n_samples=n_samples,
+        )
+        if att_results:
+            all_results["attention"] = att_results
+
+    # Final multi-kernel summary
+    if len(all_results) > 1:
+        print_final_summary(all_results, baselines)
+
+    print("[DONE] Results saved to results/")
 
 
 if __name__ == "__main__":

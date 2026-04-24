@@ -1,1 +1,11 @@
-libclang>=16.0.0
+numpy>=1.24
+scipy>=1.11
+scikit-optimize>=0.9
+
+# Optional: libclang AST parser (Upgrade 7)
+# clang>=16.0.0
+
+# Optional: cuBLAS reference for correctness verification (Upgrade 5)
+# cupy-cuda12x   # or cupy-cuda11x depending on your CUDA version
+
+# Optional: Nsight Compute Python bindings (not required; ncu CLI is used instead)
