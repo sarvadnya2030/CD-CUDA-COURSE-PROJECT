@@ -756,8 +756,39 @@ Examples:
         help="Phase D: render figures (speedup bars, roofline plot) via plots.py "
              "after tuning completes"
     )
+    # ── Phase 1 (CDC frontend) flags ───────────────────────────────────
+    parser.add_argument(
+        "--cdc-frontend", action="store_true",
+        help="Phase 1: run the PLY-based compiler frontend (lex + parse + "
+             "AST + symbol table + type check) over baseline_kernels.cu and "
+             "print the report before tuning"
+    )
+    parser.add_argument(
+        "--cdc-frontend-only", action="store_true",
+        help="Run the CDC frontend and exit (no compilation, no tuning). "
+             "Equivalent to: python -m cdc src/kernels/baseline_kernels.cu"
+    )
 
     args = parser.parse_args()
+
+    # ── CDC frontend (Phase 1) ─────────────────────────────────────────
+    if args.cdc_frontend or args.cdc_frontend_only:
+        try:
+            from cdc.frontend import run_frontend, format_report
+            kernels_cu = Path(__file__).parent / "src" / "kernels" / "baseline_kernels.cu"
+            print("[CDC] running PLY frontend (lex + parse + AST + symtab + typecheck) ...")
+            result = run_frontend(kernels_cu)
+            print(format_report(result, show_ast=False, show_symbols=True))
+            print()
+            if not result.ok():
+                print("[CDC] frontend reported errors; exiting.", flush=True)
+                return
+        except Exception as e:
+            print(f"[CDC] frontend failed: {e}")
+            if args.cdc_frontend_only:
+                return
+        if args.cdc_frontend_only:
+            return
 
     # --iters is a backward-compat alias for --samples
     n_samples = args.samples
