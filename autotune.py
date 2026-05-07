@@ -783,12 +783,18 @@ Examples:
         help="Phase 3: estimate per-kernel register pressure from live-vars "
              "and feed the auto-tuner's tile/unroll cost model"
     )
+    parser.add_argument(
+        "--cdc-peephole", action="store_true",
+        help="Phase 4: run PTX peephole optimiser on every results/<k>.ptx "
+             "file (requires --ptx-analysis or a previous run that produced "
+             "PTX); writes <k>.peep.ptx and prints fired-pattern counts"
+    )
 
     args = parser.parse_args()
 
     # ── CDC frontend (Phase 1) ─────────────────────────────────────────
     if args.cdc_frontend or args.cdc_frontend_only or args.cdc_ir \
-       or args.cdc_opt or args.cdc_regs:
+       or args.cdc_opt or args.cdc_regs or args.cdc_peephole:
         try:
             from cdc.frontend import run_frontend, format_report
             kernels_cu = Path(__file__).parent / "src" / "kernels" / "baseline_kernels.cu"
@@ -881,6 +887,35 @@ Examples:
                 import traceback
                 print(f"[CDC] opt pipeline failed: {e}")
                 traceback.print_exc()
+
+        # Phase 4: PTX peephole on whichever PTX files we already have
+        if args.cdc_peephole:
+            try:
+                from cdc.peephole import optimise_ptx_file, summarise_passes
+                ptx_paths = list(Path("results").glob("*.ptx"))
+                if not ptx_paths:
+                    # Fallback: run on the bundled sample so the demo still
+                    # produces visible output without nvcc.
+                    sample = Path(__file__).parent / "cdc" / "peephole" / "sample.ptx"
+                    if sample.exists():
+                        ptx_paths = [sample]
+                if not ptx_paths:
+                    print("[CDC] no PTX files in results/; "
+                          "run autotune.py with --ptx-analysis first.")
+                else:
+                    print("[CDC] running PTX peephole optimiser ...")
+                    for ptx in ptx_paths:
+                        out = ptx.with_suffix(".peep.ptx")
+                        _, stats = optimise_ptx_file(ptx, out)
+                        print(f"  {ptx.name}: "
+                              f"{sum(stats.values()):>2} patterns fired -> "
+                              f"{out.name}")
+                        if stats:
+                            for name, n in sorted(stats.items()):
+                                print(f"    {name:<16} {n:>3}")
+                print()
+            except Exception as e:
+                print(f"[CDC] peephole pipeline failed: {e}")
 
         if args.cdc_frontend_only:
             return

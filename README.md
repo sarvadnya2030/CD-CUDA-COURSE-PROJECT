@@ -1,6 +1,22 @@
-# CUDA Kernel Auto-Tuner — Systematic GPU Optimization via Compiler-Guided Parameter Space Exploration
+# CUDA Kernel Auto-Tuner — A Source-to-Source Compiler with Auto-Tuning Backend
 
-Automatically tunes naive CUDA kernels by generating, compiling, and statistically benchmarking parameter variants to find the fastest configuration. Targets the NVIDIA RTX 2070 (sm_75, Turing).
+A complete compiler frontend, intermediate-representation pipeline, optimisation framework, and peephole pass for a CUDA C subset, driving an auto-tuning code generator that targets the NVIDIA RTX 2070 (sm_75, Turing).
+
+The project is structured as a textbook compiler:
+
+```
+   source.cu  ──►  PLY lexer + parser  ──►  AST + symbol table + type check
+              ──►  three-address code (quadruples)
+              ──►  basic blocks + CFG + dominators + DAG
+              ──►  data-flow analysis (live-vars / reaching-defs / available-exprs)
+              ──►  classical optimisation passes (const-prop, CSE, DCE, LICM, strength reduction)
+              ──►  template-based code generator (machine-dependent optimisation)
+              ──►  nvcc → PTX → peephole optimiser → SASS
+```
+
+Each phase is independently runnable — the whole pipeline is a viva-ready demonstration of the Compiler Design syllabus. See **[CD_MAPPING.md](CD_MAPPING.md)** for a per-unit syllabus → code map and `results/plots/cd_mapping.png` for the one-slide visual summary.
+
+The auto-tuner sits on top of this pipeline: it consumes the live-variable analysis to estimate register pressure, prunes infeasible (tile, unroll) variants accordingly, generates the surviving variants, compiles them, and statistically benchmarks each one to pick the fastest.
 
 ---
 
@@ -90,6 +106,19 @@ python autotune.py --kernel=reduction --skip-verification --workers=4
 
 # Phase A-D: libclang-driven search space + in-process CHECK + ncu + plots
 python autotune.py --kernel=matmul --use-libclang --with-correctness --ncu --plots
+
+# CD pipeline (Phases 1-4): visible compiler-design output for the viva
+python -m cdc src/kernels/baseline_kernels.cu --tokens         # lexer
+python -m cdc src/kernels/baseline_kernels.cu                  # frontend report
+python -m cdc src/kernels/baseline_kernels.cu --ir             # TAC + BB + CFG + DAG
+python -m cdc src/kernels/baseline_kernels.cu --dfa            # live-vars / reaching-defs / available-exprs
+python -m cdc src/kernels/baseline_kernels.cu --opt            # const-prop, CSE, DCE, LICM, strength reduction
+python -m cdc src/kernels/baseline_kernels.cu --regs           # live-range / register pressure
+python -m cdc.peephole.ptx_peephole cdc/peephole/sample.ptx    # PTX peephole
+
+# Same content surfaced through the auto-tuner CLI:
+python autotune.py --cdc-frontend-only                          # just the frontend report
+python autotune.py --baseline-only --cdc-ir --cdc-opt --cdc-regs --cdc-peephole
 ```
 
 ---
@@ -274,6 +303,46 @@ Three additions in `generator.py`:
 
 ---
 
+## Compiler Design Layer (`cdc/`)
+
+Every Compiler Design syllabus unit maps to a concrete file in this repository.  The full mapping with viva-runnable demonstrations is in **[CD_MAPPING.md](CD_MAPPING.md)** and the visual summary is `results/plots/cd_mapping.png` (regenerable with `python -m src.cd_mapping_figure`).
+
+Pipeline:
+
+```
+   cdc/preprocessor.py    strip comments / #include / #pragma; preserve line numbers
+   cdc/lexer.py           PLY/LEX tokeniser (Unit II)
+   cdc/parser.py          PLY/YACC LALR(1) grammar building an AST  (Unit III, IV)
+   cdc/ast_nodes.py       AST class hierarchy + pretty-printer
+   cdc/symbol_table.py    Scoped symbol table with CUDA builtins   (Unit III)
+   cdc/type_check.py      Combined symtab + type pass; address-space rules
+
+   cdc/ir/tac.py          Three-address code (quadruples)          (Unit IV)
+   cdc/ir/basic_block.py  Leaders algorithm                        (Unit V)
+   cdc/ir/cfg.py          CFG + dominator tree                     (Unit V/VI)
+   cdc/ir/dag.py          DAG-of-basic-block                       (Unit V)
+
+   cdc/opt/dfa.py         Iterative-worklist DFA framework + 3 analyses
+                            - LiveVariables       (backward, union)
+                            - ReachingDefinitions (forward,  union)
+                            - AvailableExpressions(forward,  intersect)
+                                                                   (Unit VI)
+   cdc/opt/const_prop.py  Constant propagation + folding           (Unit VI)
+   cdc/opt/cse.py         Common-subexpression elimination          (Unit VI)
+   cdc/opt/dce.py         Dead-code elimination via live-vars      (Unit VI)
+   cdc/opt/licm.py        Loop-invariant code motion (dominator-based)
+   cdc/opt/strength_reduce.py  Strength reduction patterns         (Unit V/VI)
+   cdc/opt/register_pressure.py  Live-range counter feeds the auto-tuner
+
+   cdc/peephole/ptx_peephole.py  Peephole optimiser running on real PTX
+                                  (mul+add->fma, redundant mov/load, alg
+                                  identities)                       (Unit V)
+```
+
+Auto-tuner integration flags: `--cdc-frontend`, `--cdc-frontend-only`, `--cdc-ir`, `--cdc-opt`, `--cdc-regs`, `--cdc-peephole`.  Standalone CLI: `python -m cdc <file.cu> [--tokens|--ir|--dfa|--opt|--regs|--dot|--ast|--diag-only] [--kernel NAME]`.
+
+---
+
 ## Output Files
 
 | File | Description |
@@ -353,9 +422,35 @@ TIMING layernorm_512x2048 0.3788 0.3752 0.3811 30
 
 ```
 Cuda-Optimization/
-├── autotune.py                    # Main entry point (Phase A-D flags wired here)
+├── autotune.py                    # Main entry point (CD + Phase A-D flags wired here)
 ├── requirements.txt
 ├── README.md
+├── CD_MAPPING.md                  # Syllabus -> code mapping for the CD viva
+├── streamlit_dashboard.py         # Live tuning dashboard
+├── cdc/                           # Compiler Design Components (CD pipeline)
+│   ├── lexer.py                   # Unit II: PLY tokeniser
+│   ├── parser.py                  # Unit III: PLY/YACC LALR(1) grammar
+│   ├── ast_nodes.py               # Unit IV: AST hierarchy
+│   ├── symbol_table.py            # Unit III: scoped table + CUDA builtins
+│   ├── type_check.py              # Unit III/IV: combined symtab + type pass
+│   ├── preprocessor.py            # Comment / #include / #pragma stripping
+│   ├── frontend.py                # Pipeline orchestration
+│   ├── ir/
+│   │   ├── tac.py                 # Unit IV: three-address code (quadruples)
+│   │   ├── basic_block.py         # Unit V: basic blocks (leaders algorithm)
+│   │   ├── cfg.py                 # Unit V: CFG + dominator tree
+│   │   └── dag.py                 # Unit V: DAG-of-basic-block
+│   ├── opt/
+│   │   ├── dfa.py                 # Unit VI: iterative-worklist DFA framework
+│   │   ├── const_prop.py          # Unit VI: constant propagation + folding
+│   │   ├── cse.py                 # Unit VI: common-subexpression elimination
+│   │   ├── dce.py                 # Unit VI: dead-code elimination
+│   │   ├── licm.py                # Unit VI: loop-invariant code motion
+│   │   ├── strength_reduce.py     # Unit V/VI: strength reduction
+│   │   └── register_pressure.py   # Unit VI: live-range count + cost model
+│   └── peephole/
+│       ├── ptx_peephole.py        # Unit V: PTX peephole optimiser
+│       └── sample.ptx             # Hand-crafted PTX exercising all patterns
 └── src/
     ├── parser.py                  # Phase A / Upgrade 7: libclang + regex kernel parser
     ├── generator.py               # Template-based .cu code generator
@@ -372,8 +467,10 @@ Cuda-Optimization/
     ├── reporter.py                # Upgrade 8: Markdown reports + terminal tables
     ├── cuda_graph.py              # Upgrade 9: CUDA Graph benchmark
     ├── plots.py                   # Phase D: speedup / roofline figure render
+    ├── cd_mapping_figure.py       # Renders results/plots/cd_mapping.png
     └── kernels/
-        ├── baseline_kernels.cu    # 4 intentionally naive kernels
+        ├── baseline_kernels.cu    # 5 intentionally naive kernels (matmul, softmax,
+        │                          # reduction, layernorm, attention)
         ├── naive_kernels.cuh      # Header form of the naive kernels (used by
         │                          # the Phase-B in-process CHECK driver)
         └── benchmark_runner.cu    # Standalone baseline profiler

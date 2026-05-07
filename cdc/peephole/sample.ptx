@@ -1,0 +1,49 @@
+//
+// Synthetic PTX sample exercising every peephole pattern.
+// Hand-written, not produced by nvcc.  Used by the test in
+// `cdc/peephole/test_peephole.py` and as a viva demo of
+// "compile this with --ptx-peephole and watch the patterns fire".
+//
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry sample_kernel(
+    .param .u64 sample_kernel_param_0,
+    .param .u64 sample_kernel_param_1
+)
+{
+    .reg .f32 %f<32>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64    %rd1, [sample_kernel_param_0];
+    ld.param.u64    %rd2, [sample_kernel_param_1];
+
+    // --- Pattern 1: mul + add => fma -------------------------------
+    ld.global.f32   %f1, [%rd1];
+    ld.global.f32   %f2, [%rd1+4];
+    ld.global.f32   %f3, [%rd1+8];
+    mul.f32         %f4, %f1, %f2;
+    add.f32         %f5, %f4, %f3;
+
+    // --- Pattern 2: self-mov should be deleted ---------------------
+    mov.f32         %f6, %f6;
+
+    // --- Pattern 3: double-mov => single mov ----------------------
+    mov.f32         %f7, %f1;
+    mov.f32         %f8, %f7;
+
+    // --- Pattern 4: add 0 / mul 1 algebraic identity ---------------
+    add.f32         %f9,  %f5, 0f00000000;
+    mul.f32         %f10, %f9, 0f3F800000;
+
+    // --- Pattern 5: redundant load ---------------------------------
+    ld.global.f32   %f11, [%rd2];
+    ld.global.f32   %f12, [%rd2];
+
+    add.f32         %f20, %f10, %f11;
+    add.f32         %f21, %f20, %f12;
+    st.global.f32   [%rd2+0], %f21;
+
+    ret;
+}
