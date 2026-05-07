@@ -768,18 +768,24 @@ Examples:
         help="Run the CDC frontend and exit (no compilation, no tuning). "
              "Equivalent to: python -m cdc src/kernels/baseline_kernels.cu"
     )
+    parser.add_argument(
+        "--cdc-ir", action="store_true",
+        help="Phase 2: emit TAC + basic blocks + CFG + DAG for every kernel "
+             "after the frontend pass.  Equivalent to: python -m cdc <file> --ir"
+    )
 
     args = parser.parse_args()
 
     # ── CDC frontend (Phase 1) ─────────────────────────────────────────
-    if args.cdc_frontend or args.cdc_frontend_only:
+    if args.cdc_frontend or args.cdc_frontend_only or args.cdc_ir:
         try:
             from cdc.frontend import run_frontend, format_report
             kernels_cu = Path(__file__).parent / "src" / "kernels" / "baseline_kernels.cu"
             print("[CDC] running PLY frontend (lex + parse + AST + symtab + typecheck) ...")
             result = run_frontend(kernels_cu)
-            print(format_report(result, show_ast=False, show_symbols=True))
-            print()
+            if args.cdc_frontend or args.cdc_frontend_only:
+                print(format_report(result, show_ast=False, show_symbols=True))
+                print()
             if not result.ok():
                 print("[CDC] frontend reported errors; exiting.", flush=True)
                 return
@@ -787,6 +793,29 @@ Examples:
             print(f"[CDC] frontend failed: {e}")
             if args.cdc_frontend_only:
                 return
+
+        # Phase 2: TAC + basic blocks + CFG + DAG
+        if args.cdc_ir:
+            try:
+                from cdc.ir import emit_tac, partition_blocks, build_cfg, build_dag
+                print("[CDC] running IR pipeline (TAC -> BB -> CFG -> DAG) ...")
+                for k in result.kernels:
+                    prog = emit_tac(k.ast)
+                    blocks = partition_blocks(prog)
+                    cfg = build_cfg(blocks)
+                    n_dag = sum(len(build_dag(b)) for b in blocks)
+                    n_edges = sum(len(s) for s in cfg.succ.values())
+                    print(f"  {k.name:<20} "
+                          f"quads={len(prog.quads):>3}  "
+                          f"BBs={len(blocks):>2}  "
+                          f"edges={n_edges:>2}  "
+                          f"DAG-nodes={n_dag:>3}")
+                print()
+                print("[CDC] use 'python -m cdc <file.cu> --ir' for full per-kernel output.")
+                print()
+            except Exception as e:
+                print(f"[CDC] IR pipeline failed: {e}")
+
         if args.cdc_frontend_only:
             return
 
