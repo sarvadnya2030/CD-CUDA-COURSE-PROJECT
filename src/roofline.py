@@ -1,116 +1,250 @@
 """
-roofline.py — roofline analysis for the auto-tuner.
+roofline.py — Roofline model integration for RTX 2070 (sm_75).
 
-Hardware target: NVIDIA RTX 2070 (Turing, sm_75).
-  - 2304 CUDA cores
-  - 1.62 GHz boost clock
-  - Theoretical peak fp32 FMA: 2 * 2304 * 1.62e9 ≈ 7.46 TFLOPS
-  - Memory: 8 GB GDDR6, 256-bit bus, 14 Gbps → 448 GB/s peak
+The Roofline model (Williams et al., 2009) characterises whether a kernel is
+memory-bandwidth-bound or compute-bound by comparing its arithmetic intensity
+(FLOP/byte) against the hardware ridge point.
 
-For each kernel we record:
-  - Analytic FLOPs and bytes (problem-size lower bound, ignoring cache reuse).
-  - Measured GFLOPS and effective bandwidth at the best tuned time.
-  - Arithmetic intensity (flops / bytes).
-  - Roofline upper bound = min(peak_fp32, AI * peak_bw).
-  - Percent of roofline achieved.
+RTX 2070 constants:
+  peak_tflops  = 7.5  TFLOP/s  (FP32)
+  mem_bw_gbps  = 448  GB/s     (GDDR6 peak)
+  ridge_point  = peak_tflops * 1e12 / (mem_bw_gbps * 1e9)  ≈ 16.74 FLOP/byte
 
-If ncu metrics are also supplied (dram__bytes.sum), we derive a *measured*
-bytes figure that accounts for actual DRAM traffic (typically much higher
-than the analytic minimum because of multi-read / cache-miss behaviour).
+This module exposes two APIs:
+
+  1. RooflineAnalyzer (class) — primary API used by reporter, visualization,
+     streamlit_dashboard, search.
+  2. compute_roofline / format_table (legacy functions) — used by autotune,
+     plots and benchmark.  Supports an optional ncu_metrics dict to supply
+     measured DRAM bytes (dram__bytes.sum) for measured-AI roofline points.
+
+Reference:
+  Williams, S., Waterman, A., & Patterson, D. (2009).
+  Roofline: An insightful visual performance model for multicore architectures.
+  Communications of the ACM, 52(4), 65–76.
 """
 
-from dataclasses import dataclass, asdict
-from typing import Optional
+from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal, Optional
 
-# ── RTX 2070 peaks ─────────────────────────────────────────────────────────
+# ── Hardware constants (RTX 2070) ──────────────────────────────────────────
 
+PEAK_TFLOPS    = 7.5          # FP32 tensor TFLOP/s
+MEM_BW_GBPS    = 448.0        # peak DRAM bandwidth GB/s
+RIDGE_POINT    = PEAK_TFLOPS * 1e3 / MEM_BW_GBPS   # FLOP/byte  ≈ 16.74
+
+# Hardware descriptor used by legacy callers (plots.py, benchmark.py).
 RTX2070 = {
     "name":            "NVIDIA GeForce RTX 2070",
     "arch":            "sm_75",
     "cores":           2304,
     "boost_clock_ghz": 1.62,
-    "peak_fp32_tflops": 7.46,            # 2 * 2304 * 1.62 GHz (FMA counted as 2)
-    "peak_bw_gbs":     448.0,            # 256-bit @ 14 Gbps GDDR6
+    "peak_fp32_tflops": PEAK_TFLOPS,
+    "peak_bw_gbs":     MEM_BW_GBPS,
+}
+
+BoundType = Literal["memory", "compute"]
+
+# ── Per-kernel analytical FLOP and byte models ─────────────────────────────
+# All sizes are element counts (not bytes); element size = sizeof(float) = 4.
+
+def _matmul_flops(N: int) -> int:
+    return 2 * N * N * N
+
+
+def _matmul_bytes(N: int) -> int:
+    return 3 * N * N * 4
+
+
+def _softmax_flops(R: int, C: int) -> int:
+    return 5 * R * C
+
+
+def _softmax_bytes(R: int, C: int) -> int:
+    return 2 * R * C * 4
+
+
+def _reduction_flops(N: int) -> int:
+    return 2 * N
+
+
+def _reduction_bytes(N: int) -> int:
+    return N * 4
+
+
+def _layernorm_flops(R: int, C: int) -> int:
+    return 8 * R * C
+
+
+def _layernorm_bytes(R: int, C: int) -> int:
+    return 3 * R * C * 4
+
+
+def _attention_flops(S: int, D: int) -> int:
+    return 4 * S * S * D + 5 * S * S
+
+
+def _attention_bytes_flash(S: int, D: int) -> int:
+    return 4 * S * D * 4
+
+
+def _attention_bytes_naive(S: int, D: int) -> int:
+    return (3 * S * D + 2 * S * S + S * D) * 4
+
+
+# ── Default problem dimensions per kernel ──────────────────────────────────
+
+KERNEL_DIMS: dict[str, tuple] = {
+    "matmul":    (1024,),
+    "softmax":   (1024, 4096),
+    "reduction": (1 << 20,),
+    "layernorm": (512, 2048),
+    "attention": (512, 64),
 }
 
 
-# ── Per-kernel analytic FLOP and byte counts ───────────────────────────────
-# These use the same problem sizes as benchmark_runner.cu and the generator.
-
-def _matmul_counts(N: int = 1024) -> dict:
-    # Naive: 2N³ fp32 FMAs (counted as 2 flops each).
-    # Byte lower bound: each element of A, B read once; C written once.
-    return {
-        "flops":  2 * (N ** 3),
-        "bytes":  3 * (N ** 2) * 4,
-        "shape":  f"{N}x{N}",
-    }
+def get_dims(kernel: str) -> tuple:
+    """Return the canonical problem dimensions for a kernel."""
+    base = kernel.split("_")[0]
+    return KERNEL_DIMS.get(base, KERNEL_DIMS.get(kernel, (1024,)))
 
 
-def _softmax_counts(rows: int = 1024, cols: int = 4096) -> dict:
-    # Per element: 1 subtract + 1 exp (~20 flops amortized) + 1 divide
-    # Conservative: 5 flops/elem.  Bytes: read once + write once → 2 * rows*cols.
-    n = rows * cols
-    return {
-        "flops":  5 * n,
-        "bytes":  2 * n * 4,
-        "shape":  f"{rows}x{cols}",
-    }
+@dataclass
+class RooflinePoint:
+    """A single kernel's position on the roofline chart."""
+    kernel: str
+    dims: tuple
+    arithmetic_intensity: float
+    achieved_gflops: float
+    peak_gflops: float
+    bound_type: BoundType
+    efficiency_pct: float
 
 
-def _reduction_counts(N: int = 1 << 20) -> dict:
-    # One add per element; output is a single scalar (per block, but analytic
-    # bytes uses the dominant input traffic).
-    return {
-        "flops":  N,
-        "bytes":  N * 4,
-        "shape":  f"N={N}",
-    }
+class RooflineAnalyzer:
+    """
+    Primary roofline API.  Compute roofline metrics for the auto-tuned kernels
+    on RTX 2070.
+
+        ra = RooflineAnalyzer()
+        ai = ra.arithmetic_intensity("matmul", (1024,))
+        bt = ra.bound_type("matmul", (1024,))
+        pt = ra.analyze("matmul", (1024,), elapsed_ms=4.8)
+    """
+
+    peak_tflops: float = PEAK_TFLOPS
+    mem_bw_gbps: float = MEM_BW_GBPS
+    ridge_point: float = RIDGE_POINT
+
+    # ── FLOP / byte analytics ──────────────────────────────────────────────
+
+    def total_flops(self, kernel: str, dims: tuple) -> int:
+        k = kernel.split("_")[0]
+        if k == "matmul":    return _matmul_flops(*dims)
+        if k == "softmax":   return _softmax_flops(*dims)
+        if k == "reduction": return _reduction_flops(*dims)
+        if k == "layernorm": return _layernorm_flops(*dims)
+        if k == "attention": return _attention_flops(*dims)
+        raise ValueError(f"Unknown kernel: {kernel!r}")
+
+    def total_bytes(self, kernel: str, dims: tuple) -> int:
+        k = kernel.split("_")[0]
+        if k == "matmul":    return _matmul_bytes(*dims)
+        if k == "softmax":   return _softmax_bytes(*dims)
+        if k == "reduction": return _reduction_bytes(*dims)
+        if k == "layernorm": return _layernorm_bytes(*dims)
+        if k == "attention": return _attention_bytes_flash(*dims)
+        raise ValueError(f"Unknown kernel: {kernel!r}")
+
+    def arithmetic_intensity(self, kernel: str, dims: tuple) -> float:
+        return self.total_flops(kernel, dims) / self.total_bytes(kernel, dims)
+
+    def achieved_gflops(self, kernel: str, dims: tuple, elapsed_ms: float) -> float:
+        if elapsed_ms <= 0:
+            return 0.0
+        return self.total_flops(kernel, dims) / (elapsed_ms * 1e6)
+
+    def bound_type(self, kernel: str, dims: tuple) -> BoundType:
+        return "memory" if self.arithmetic_intensity(kernel, dims) < self.ridge_point else "compute"
+
+    def peak_performance(self, kernel: str, dims: tuple) -> float:
+        ai = self.arithmetic_intensity(kernel, dims)
+        if ai < self.ridge_point:
+            return ai * self.mem_bw_gbps
+        return self.peak_tflops * 1000.0
+
+    def efficiency_pct(self, kernel: str, dims: tuple, elapsed_ms: float) -> float:
+        achieved = self.achieved_gflops(kernel, dims, elapsed_ms)
+        ceiling  = self.peak_performance(kernel, dims)
+        if ceiling <= 0:
+            return 0.0
+        return min(achieved / ceiling * 100.0, 100.0)
+
+    def analyze(self, kernel: str, dims: tuple, elapsed_ms: float) -> RooflinePoint:
+        return RooflinePoint(
+            kernel=kernel,
+            dims=dims,
+            arithmetic_intensity=self.arithmetic_intensity(kernel, dims),
+            achieved_gflops=self.achieved_gflops(kernel, dims, elapsed_ms),
+            peak_gflops=self.peak_performance(kernel, dims),
+            bound_type=self.bound_type(kernel, dims),
+            efficiency_pct=self.efficiency_pct(kernel, dims, elapsed_ms),
+        )
+
+    def print_summary_table(
+        self,
+        entries: list[tuple[str, tuple, float]],
+        title: str = "Roofline Summary",
+    ) -> None:
+        print(f"\n{'='*74}")
+        print(f"  {title}  |  RTX 2070  |  ridge={self.ridge_point:.1f} FLOP/byte")
+        print(f"{'='*74}")
+        print(f"{'Kernel':<22} {'AI':>8} {'Bound':>8} "
+              f"{'Achieved':>10} {'Ceiling':>10} {'Eff%':>6}")
+        print("-" * 74)
+        for kernel, dims, elapsed_ms in entries:
+            pt = self.analyze(kernel, dims, elapsed_ms)
+            print(
+                f"{kernel:<22} "
+                f"{pt.arithmetic_intensity:>7.2f}  "
+                f"{pt.bound_type:>8}  "
+                f"{pt.achieved_gflops:>8.1f}G  "
+                f"{pt.peak_gflops:>8.1f}G  "
+                f"{pt.efficiency_pct:>5.1f}%"
+            )
+        print("=" * 74 + "\n")
 
 
-def _layernorm_counts(rows: int = 512, cols: int = 2048) -> dict:
-    # Per element: mean-sum, sqr-sum, normalize, scale+shift → ~8 flops/elem.
-    # Bytes: read input + gamma + beta, write output → 3 * rows*cols + 2*cols.
-    n = rows * cols
-    return {
-        "flops":  8 * n,
-        "bytes":  3 * n * 4 + 2 * cols * 4,
-        "shape":  f"{rows}x{cols}",
-    }
-
+# ── Legacy API (compute_roofline, RooflineResult, format_table) ────────────
+# Kept for autotune.py, plots.py, benchmark.py.  Adds ncu-aware measured-bytes
+# support that the class API doesn't expose.
 
 KERNEL_COUNTS = {
-    "matmul":    _matmul_counts(),
-    "softmax":   _softmax_counts(),
-    "reduction": _reduction_counts(),
-    "layernorm": _layernorm_counts(),
+    "matmul":    {"flops": _matmul_flops(1024), "bytes": _matmul_bytes(1024), "shape": "1024x1024"},
+    "softmax":   {"flops": _softmax_flops(1024, 4096), "bytes": _softmax_bytes(1024, 4096), "shape": "1024x4096"},
+    "reduction": {"flops": _reduction_flops(1 << 20), "bytes": _reduction_bytes(1 << 20), "shape": f"N={1<<20}"},
+    "layernorm": {"flops": _layernorm_flops(512, 2048), "bytes": _layernorm_bytes(512, 2048), "shape": "512x2048"},
+    "attention": {"flops": _attention_flops(512, 64), "bytes": _attention_bytes_flash(512, 64), "shape": "S=512 D=64"},
 }
 
-
-# ── Roofline calculation ───────────────────────────────────────────────────
 
 @dataclass
 class RooflineResult:
-    kernel:            str
-    shape:             str
-    mean_ms:           float
-
-    # Analytic (problem-size lower bounds)
-    flops_analytic:    float
-    bytes_analytic:    float
-    ai_analytic:       float        # flop/byte
-    gflops_analytic:   float
-    bw_analytic_gbs:   float
-
-    # Roofline bound at the analytic arithmetic intensity
-    bound_gflops:      float        # min(peak_fp32, ai * peak_bw)
-    pct_of_roof:       float        # measured_gflops / bound_gflops * 100
-
-    # Optional: measured DRAM bytes from ncu (dram__bytes.sum)
-    bytes_measured:    Optional[float] = None
-    bw_measured_gbs:   Optional[float] = None
-    ai_measured:       Optional[float] = None
+    kernel:           str
+    shape:            str
+    mean_ms:          float
+    flops_analytic:   float
+    bytes_analytic:   float
+    ai_analytic:      float
+    gflops_analytic:  float
+    bw_analytic_gbs:  float
+    bound_gflops:     float
+    pct_of_roof:      float
+    bytes_measured:   Optional[float] = None
+    bw_measured_gbs:  Optional[float] = None
+    ai_measured:      Optional[float] = None
 
 
 def compute_roofline(kernel: str, mean_ms: float,
@@ -125,10 +259,9 @@ def compute_roofline(kernel: str, mean_ms: float,
     bw_gbs = bytes_ / time_s / 1e9
     ai     = flops  / bytes_
 
-    peak_flops_gflops = RTX2070["peak_fp32_tflops"] * 1000
-    peak_bw           = RTX2070["peak_bw_gbs"]
-    bound             = min(peak_flops_gflops, ai * peak_bw)
-    pct               = 100.0 * gflops / bound if bound > 0 else 0.0
+    peak_flops_gflops = PEAK_TFLOPS * 1000
+    bound = min(peak_flops_gflops, ai * MEM_BW_GBPS)
+    pct   = 100.0 * gflops / bound if bound > 0 else 0.0
 
     bytes_meas = bw_meas = ai_meas = None
     if ncu_metrics:
@@ -139,24 +272,15 @@ def compute_roofline(kernel: str, mean_ms: float,
             ai_meas    = flops / bytes_meas
 
     return RooflineResult(
-        kernel           = kernel,
-        shape            = counts["shape"],
-        mean_ms          = mean_ms,
-        flops_analytic   = flops,
-        bytes_analytic   = bytes_,
-        ai_analytic      = ai,
-        gflops_analytic  = gflops,
-        bw_analytic_gbs  = bw_gbs,
-        bound_gflops     = bound,
-        pct_of_roof      = pct,
-        bytes_measured   = bytes_meas,
-        bw_measured_gbs  = bw_meas,
-        ai_measured      = ai_meas,
+        kernel=kernel, shape=counts["shape"], mean_ms=mean_ms,
+        flops_analytic=flops, bytes_analytic=bytes_, ai_analytic=ai,
+        gflops_analytic=gflops, bw_analytic_gbs=bw_gbs,
+        bound_gflops=bound, pct_of_roof=pct,
+        bytes_measured=bytes_meas, bw_measured_gbs=bw_meas, ai_measured=ai_meas,
     )
 
 
 def format_table(results: list[RooflineResult]) -> str:
-    """Return a human-readable roofline summary table."""
     lines = []
     lines.append(f"{'='*92}")
     lines.append(f"Roofline summary — {RTX2070['name']} "
@@ -182,20 +306,23 @@ def format_table(results: list[RooflineResult]) -> str:
     return "\n".join(lines)
 
 
-# ── CLI: read a tuning JSON and print roofline ─────────────────────────────
+# ── CLI ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import json
     import sys
     from pathlib import Path
 
-    if len(sys.argv) < 2:
-        results_dir = Path(__file__).parent.parent / "results"
-    else:
-        results_dir = Path(sys.argv[1])
+    ra = RooflineAnalyzer()
+    print(f"RTX 2070 ridge point: {ra.ridge_point:.2f} FLOP/byte\n")
 
-    rr = []
-    for kernel in ("matmul", "softmax", "reduction", "layernorm"):
+    if len(sys.argv) >= 2:
+        results_dir = Path(sys.argv[1])
+    else:
+        results_dir = Path(__file__).parent.parent / "results"
+
+    rr: list[RooflineResult] = []
+    for kernel in ("matmul", "softmax", "reduction", "layernorm", "attention"):
         f = results_dir / f"{kernel}_tuning.json"
         if not f.exists():
             continue
@@ -209,4 +336,10 @@ if __name__ == "__main__":
     if rr:
         print(format_table(rr))
     else:
-        print(f"No tuning JSON files found under {results_dir}")
+        sample = [
+            ("matmul",    (1024,),        4.84),
+            ("softmax",   (1024, 4096),   1.44),
+            ("reduction", (1 << 20,),     0.089),
+            ("layernorm", (512, 2048),    0.379),
+        ]
+        ra.print_summary_table(sample, "Baseline Roofline (sample)")

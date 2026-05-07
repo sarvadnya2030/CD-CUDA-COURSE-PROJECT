@@ -1,3 +1,24 @@
-libclang>=16.0.0
-matplotlib>=3.7
+# Core
+numpy>=1.24
+scipy>=1.11
 
+# Search strategies
+scikit-optimize>=0.9
+
+# Plotting / reports
+matplotlib>=3.7
+plotly>=5.18
+pandas>=2.0
+
+# Live dashboard
+streamlit>=1.30
+
+# Compiler frontend (Phase A: libclang AST + Phase 1: PLY lexer/parser)
+libclang>=16.0.0
+ply>=3.11
+
+# PyTorch integration (attention/SDPA reference)
+torch>=2.1
+
+# Optional: cuBLAS reference for correctness verification
+# cupy-cuda12x   # or cupy-cuda11x depending on your CUDA version

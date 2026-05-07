@@ -1,25 +1,33 @@
 """
 generator.py — template-based CUDA code generator.
 
-Takes a kernel profile + a concrete parameter configuration and emits a
-standalone .cu file that (a) runs the naive reference kernel on the same
-input to compute an expected output, (b) runs the optimized variant with
-CUDA event timing, and (c) element-wise compares the two outputs.
+Takes a kernel profile + a concrete parameter configuration and emits a .cu
+file containing the optimised kernel and a self-contained benchmark main().
 
-Each generated binary prints two lines to stdout:
+Two driver flavours are supported:
 
-    TIMING <variant_tag> <mean_ms> <min_ms> <max_ms> <iters>
-    CHECK  <variant_tag> <max_rel_err> <pass>      # pass = 0/1
+  Default ("statistical" driver, friend's path)
+    Emits SAMPLE <tag> <ms>     — one per measured iteration
+    Emits TIMING <tag> <mean> <min> <max> <iters>
 
-The autotune driver parses both. Variants that fail CHECK are dropped from
-the tuning results.
+  Correctness driver (Phase B, with_correctness=True)
+    Embeds the naive reference kernel from src/kernels/naive_kernels.cuh,
+    runs it on the same inputs, and emits an extra
+        CHECK <tag> <max_rel_err> <pass>
+    line so the autotune driver can drop variants that exceed tolerance.
+
+Kernel templates available:
+  MATMUL_TEMPLATE          — shared-memory tiled matmul (square TILE_X×TILE_X).
+  MATMUL_REGBLOCK_TEMPLATE — register-blocked matmul (1×RT per thread).
+                             Selected when params['reg_tile'] > 1.
+  REDUCTION_TEMPLATE       — block-stride reduction (with optional warp-shuffle tail).
+  SOFTMAX_TEMPLATE         — row-wise softmax with shared-memory reduction.
+  LAYERNORM_TEMPLATE       — three-pass layernorm (mean → var → normalise).
+  LAYERNORM_SINGLEPASS_TEMPLATE — single-pass layernorm (sum + sum-of-squares
+                             accumulated in parallel; faster but less stable).
 """
 
 import itertools
-import json
-import os
-import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -30,28 +38,30 @@ RESULTS_DIR = ROOT / "results"
 GEN_DIR     = RESULTS_DIR / "generated"
 GEN_DIR.mkdir(parents=True, exist_ok=True)
 
-ARCH = "sm_75"  # RTX 2070 (Turing)
+ARCH = "sm_75"   # RTX 2070 (Turing)
 
 # Absolute posix path to the naive-kernels header so nvcc can find it from
-# the generated file's location regardless of working directory.
+# the generated file's location regardless of working directory.  Used by
+# the with-correctness driver path (mine, Phase B).
 _NAIVE_HEADER = (ROOT / "src" / "kernels" / "naive_kernels.cuh").resolve().as_posix()
 
-# Correctness tolerance used by the comparison code embedded in each binary.
+# Correctness tolerance used by the in-process comparison code.
 CORRECTNESS_TOL = 1e-2
 
 
-# ── Kernel templates ────────────────────────────────────────────────────────
+# ── Kernel templates ─────────────────────────────────────────────────────────
 
 MATMUL_TEMPLATE = """\
 /*
  * Generated matmul variant
- * block={tile_x}x{tile_x}  tile={tile_x}x{tile_y}  unroll={unroll}
- * transpose_B={transpose_b}  reg_tile={reg_tile}
+ * block={block_size}x{block_size}  tile={tile_x}x{tile_y}  unroll={unroll}
+ * transpose_B={transpose_b}
  */
 #include <cuda_runtime.h>
 
 #define TILE_X {tile_x}
 #define TILE_Y {tile_y}
+#define BLOCK  {block_size}
 
 __global__ void matmul_opt(const float* __restrict__ A,
                            const float* __restrict__ B,
@@ -86,8 +96,8 @@ __global__ void matmul_opt(const float* __restrict__ A,
 }}
 """
 
-# Register-blocked matmul: each thread computes RT outputs in the column
-# direction, reusing a single A-row load across RT B-column loads.
+# Register-blocked matmul (Phase B): each thread computes RT outputs in
+# the column direction, reusing one A-row load across RT B-column loads.
 MATMUL_REGBLOCK_TEMPLATE = """\
 /*
  * Generated matmul variant (register-blocked, 1xRT per thread)
@@ -162,8 +172,8 @@ __global__ void reduction_opt(const float* __restrict__ input,
     int gid = blockIdx.x * (blockDim.x * 2) + tid;
 
     float val = 0.0f;
-    if (gid < N)              val  = input[gid];
-    if (gid + blockDim.x < N) val += input[gid + blockDim.x];
+    if (gid < N)               val  = input[gid];
+    if (gid + blockDim.x < N)  val += input[gid + blockDim.x];
     sdata[tid] = val;
     __syncthreads();
 
@@ -230,9 +240,71 @@ __global__ void softmax_opt(const float* __restrict__ input,
 
 LAYERNORM_TEMPLATE = """\
 /*
- * Generated layernorm variant
+ * Generated layernorm variant (three-pass: mean → var → normalize)
  * block={block_size}  unroll={unroll}
- * Single-pass: accumulates sum(x) and sum(x^2) in parallel, then normalizes.
+ */
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define BLOCK {block_size}
+
+__global__ void layernorm_opt(const float* __restrict__ input,
+                              float* __restrict__ output,
+                              const float* __restrict__ gamma,
+                              const float* __restrict__ beta,
+                              int rows, int cols, float eps)
+{{
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const float* in_row  = input  + row * cols;
+    float*       out_row = output + row * cols;
+
+    // Pass 1: parallel mean
+    float thread_sum = 0.0f;
+    #pragma unroll {unroll}
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        thread_sum += in_row[i];
+    smem[threadIdx.x] = thread_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {{
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }}
+    float mean = smem[0] / cols;
+    __syncthreads();
+
+    // Pass 2: parallel variance
+    float thread_var = 0.0f;
+    #pragma unroll {unroll}
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {{
+        float d = in_row[i] - mean;
+        thread_var += d * d;
+    }}
+    smem[threadIdx.x] = thread_var;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {{
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }}
+    float inv_std = rsqrtf(smem[0] / cols + eps);
+    __syncthreads();
+
+    // Pass 3: normalize + scale + shift
+    #pragma unroll {unroll}
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        out_row[i] = gamma[i] * (in_row[i] - mean) * inv_std + beta[i];
+}}
+"""
+
+# Single-pass layernorm (Phase B): accumulates sum(x) and sum(x^2) in
+# parallel and derives mean / variance from those reductions.  Faster
+# than the three-pass variant but more sensitive to fp32 precision.
+LAYERNORM_SINGLEPASS_TEMPLATE = """\
+/*
+ * Generated layernorm variant (single-pass: sum + sum-of-squares)
+ * block={block_size}  unroll={unroll}
  */
 #include <cuda_runtime.h>
 
@@ -254,7 +326,6 @@ __global__ void layernorm_opt(const float* __restrict__ input,
     const float* in_row  = input  + row * cols;
     float*       out_row = output + row * cols;
 
-    // Phase 1: per-thread partial sums of x and x*x
     float local_sum = 0.0f, local_sq = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {{
         float v = in_row[i];
@@ -283,12 +354,81 @@ __global__ void layernorm_opt(const float* __restrict__ input,
 }}
 """
 
+# ── Benchmark drivers ─────────────────────────────────────────────────────
 
-# ── Benchmark driver template (with correctness check) ─────────────────────
-
+# Statistical driver (default): emits SAMPLE + TIMING lines.  Used by
+# benchmark.run_statistical_benchmark + reporter.py.
 BENCHMARK_MAIN = """\
 
-/* ── Benchmark driver with correctness check ──────────────────────────── */
+/* ── Benchmark driver ────────────────────────────────────────────────── */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <float.h>
+
+#define CUDA_CHECK(call) \\
+    do {{ cudaError_t e=(call); if(e!=cudaSuccess){{ \\
+        fprintf(stderr,"CUDA %s:%d %s\\n",__FILE__,__LINE__,cudaGetErrorString(e)); \\
+        exit(1); }} }} while(0)
+
+static void fill_random(float* d, int n) {{
+    float* h=(float*)malloc(n*sizeof(float));
+    for(int i=0;i<n;i++) h[i]=(float)rand()/RAND_MAX;
+    CUDA_CHECK(cudaMemcpy(d,h,n*sizeof(float),cudaMemcpyHostToDevice));
+    free(h);
+}}
+
+static void fill_ones(float* d, int n) {{
+    float* h=(float*)malloc(n*sizeof(float));
+    for(int i=0;i<n;i++) h[i]=1.0f;
+    CUDA_CHECK(cudaMemcpy(d,h,n*sizeof(float),cudaMemcpyHostToDevice));
+    free(h);
+}}
+
+int main(void) {{
+    int warmup = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
+    int iters  = getenv("ITERS")  ? atoi(getenv("ITERS"))  : 30;
+
+    {setup_code}
+
+    /* Warmup */
+    for(int i=0;i<warmup;i++) {{ {kernel_launch} }}
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start,stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    float total=0.0f, mn=FLT_MAX, mx=0.0f;
+
+    for(int i=0;i<iters;i++) {{
+        CUDA_CHECK(cudaEventRecord(start));
+        {kernel_launch}
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms=0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));
+        printf("SAMPLE {variant_tag} %.4f\\n", ms);
+        total+=ms;
+        if(ms<mn) mn=ms;
+        if(ms>mx) mx=ms;
+    }}
+
+    printf("TIMING {variant_tag} %.4f %.4f %.4f %d\\n",
+           total/iters, mn, mx, iters);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    {cleanup_code}
+    return 0;
+}}
+"""
+
+# With-correctness driver (Phase A-D path): runs the naive reference kernel
+# from naive_kernels.cuh on the same inputs, then compares output to the
+# optimized result and emits a CHECK line.  Selected via with_correctness=True.
+BENCHMARK_MAIN_WITH_CORRECTNESS = """\
+
+/* ── Benchmark driver with in-process correctness check ─────────────── */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -309,9 +449,16 @@ static void fill_random(float* d, int n) {{
     free(h);
 }}
 
+static void fill_ones(float* d, int n) {{
+    float* h=(float*)malloc(n*sizeof(float));
+    for(int i=0;i<n;i++) h[i]=1.0f;
+    CUDA_CHECK(cudaMemcpy(d,h,n*sizeof(float),cudaMemcpyHostToDevice));
+    free(h);
+}}
+
 int main(void) {{
     int warmup = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
-    int iters  = getenv("ITERS")  ? atoi(getenv("ITERS"))  : 100;
+    int iters  = getenv("ITERS")  ? atoi(getenv("ITERS"))  : 30;
 
     {setup_code}
 
@@ -323,7 +470,7 @@ int main(void) {{
     for (int i = 0; i < warmup; ++i) {{ {kernel_launch} }}
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    /* Timing */
+    /* Timing (also emits SAMPLE lines for statistical driver compat) */
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
@@ -335,6 +482,7 @@ int main(void) {{
         CUDA_CHECK(cudaEventSynchronize(stop));
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        printf("SAMPLE {variant_tag} %.4f\\n", ms);
         total += ms;
         if (ms < mn) mn = ms;
         if (ms > mx) mx = ms;
@@ -351,19 +499,17 @@ int main(void) {{
 """
 
 
-# ── Per-kernel code fragments ──────────────────────────────────────────────
+# ── Code-generation helpers ───────────────────────────────────────────────
 
-def _matmul_b_load(transpose_b: bool) -> str:
+def _matmul_b_load(transpose_b: bool, tile_x: int = 0, tile_y: int = 0) -> str:
     if transpose_b:
         return (
-            "        // Load B transposed (col-major) for coalesced reads\n"
             "        if (t * TILE_Y + ty < N && col < N)\n"
             "            Bs[ty][tx] = B[col * N + t * TILE_Y + ty];\n"
             "        else\n"
             "            Bs[ty][tx] = 0.0f;"
         )
     return (
-        "        // Load B row-major\n"
         "        if (t * TILE_Y + ty < N && col < N)\n"
         "            Bs[ty][tx] = B[(t * TILE_Y + ty) * N + col];\n"
         "        else\n"
@@ -371,7 +517,7 @@ def _matmul_b_load(transpose_b: bool) -> str:
     )
 
 
-def _reduction_body(warp_shuffle: bool) -> str:
+def _reduction_body(block_size: int, warp_shuffle: bool) -> str:
     if warp_shuffle:
         return (
             "    for (int s = blockDim.x / 2; s >= 32; s >>= 1) {\n"
@@ -396,8 +542,17 @@ def _reduction_body(warp_shuffle: bool) -> str:
     )
 
 
-# Element-wise correctness block — used for matmul, softmax, layernorm.
+def _variant_tag(kernel: str, params: dict) -> str:
+    parts = [kernel]
+    for k, v in sorted(params.items()):
+        parts.append(f"{k}{v}")
+    return "_".join(str(p) for p in parts)
+
+
+# ── Correctness blocks (Phase B: in-process numerical compare) ────────────
+
 def _elementwise_check_block(n_out_expr: str, tag: str) -> str:
+    """Element-wise max relative error check (matmul / softmax / layernorm)."""
     return f"""{{
         int n = (int)({n_out_expr});
         float* h_opt = (float*)malloc(n * sizeof(float));
@@ -419,9 +574,8 @@ def _elementwise_check_block(n_out_expr: str, tag: str) -> str:
     }}"""
 
 
-# Scalar-sum correctness block — used for reduction, where opt/ref may have
-# different grid sizes and thus different per-block output counts.
 def _scalar_sum_check_block(n_opt_expr: str, n_ref_expr: str, tag: str) -> str:
+    """Scalar-sum compare (reduction; opt and ref grids may differ)."""
     return f"""{{
         int n_opt = (int)({n_opt_expr});
         int n_ref = (int)({n_ref_expr});
@@ -440,166 +594,234 @@ def _scalar_sum_check_block(n_opt_expr: str, n_ref_expr: str, tag: str) -> str:
     }}"""
 
 
-# ── Kernel-specific generators ──────────────────────────────────────────────
+# ── Per-kernel generators ─────────────────────────────────────────────────
 
-def generate_matmul(params: dict) -> str:
+def generate_matmul(params: dict, matrix_size: int = 1024,
+                    with_correctness: bool = False) -> str:
+    """
+    Generate a complete matmul variant .cu file.
+
+    When params['reg_tile'] > 1, the register-blocked template is used
+    (each thread emits RT contiguous columns of C from a single A-row load).
+    Otherwise the shared-memory tiled template is used.
+    """
     reg_tile = params.get("reg_tile", 1)
+    N        = matrix_size
+    tag      = _variant_tag("matmul", params)
+
     if reg_tile <= 1:
-        b_load = _matmul_b_load(params["transpose_b"])
+        b_load = _matmul_b_load(params.get("transpose_b", False),
+                                params.get("tile_x", 16),
+                                params.get("tile_y", 16))
         kernel = MATMUL_TEMPLATE.format(b_load=b_load, **params)
-        bs     = params["tile_x"]                  # matmul keeps square tiles
+        bs     = params.get("tile_x", 16)
         launch = (f"matmul_opt<<<dim3((N+{bs}-1)/{bs},(N+{bs}-1)/{bs}),"
                   f"dim3({bs},{bs})>>>(A,B,C,N);")
     else:
         kernel = MATMUL_REGBLOCK_TEMPLATE.format(**params)
-        bs = params["tile_x"]                     # square BLOCK from tile_x
+        bs = params.get("tile_x", 16)
         # Grid covers N×N output: y step = BLOCK rows, x step = BLOCK*RT cols
         launch = (f"matmul_opt<<<dim3((N + {bs}*{reg_tile} - 1)/({bs}*{reg_tile}),"
                   f"(N+{bs}-1)/{bs}),"
                   f"dim3({bs},{bs})>>>(A,B,C,N);")
 
-    N    = 1024
-    tag  = _variant_tag("matmul", params)
-    # Naive reference launch: fixed 16x16 block geometry
-    ref_launch = "launch_matmul_naive(A, B, d_ref, N, 16);"
+    if with_correctness:
+        setup = (
+            f"int N = {N};\n"
+            f"    float *A, *B, *C, *d_ref;\n"
+            f"    CUDA_CHECK(cudaMalloc(&A,     N*N*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&B,     N*N*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&C,     N*N*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&d_ref, N*N*sizeof(float)));\n"
+            f"    fill_random(A, N*N);\n"
+            f"    fill_random(B, N*N);\n"
+            f"    float* d_out = C;"
+        )
+        cleanup    = "cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(d_ref);"
+        ref_launch = "launch_matmul_naive(A, B, d_ref, N, 16);"
+        check      = _elementwise_check_block("N*N", tag)
+        return kernel + BENCHMARK_MAIN_WITH_CORRECTNESS.format(
+            naive_header=_NAIVE_HEADER,
+            variant_tag=tag,
+            setup_code=setup,
+            launch_ref=ref_launch,
+            kernel_launch=launch,
+            correctness_block=check,
+            cleanup_code=cleanup,
+        )
 
-    setup = (
-        f"int N = {N};\n"
-        f"    float *A, *B, *C, *d_ref;\n"
-        f"    CUDA_CHECK(cudaMalloc(&A,     N*N*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&B,     N*N*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&C,     N*N*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&d_ref, N*N*sizeof(float)));\n"
-        f"    fill_random(A, N*N);\n"
-        f"    fill_random(B, N*N);\n"
-        f"    float* d_out = C;"
-    )
-    cleanup = ("cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(d_ref);")
-    check   = _elementwise_check_block("N*N", tag)
-
+    setup   = (f"int N={N}; float *A,*B,*C;\n"
+               f"    CUDA_CHECK(cudaMalloc(&A,N*N*4));\n"
+               f"    CUDA_CHECK(cudaMalloc(&B,N*N*4));\n"
+               f"    CUDA_CHECK(cudaMalloc(&C,N*N*4));\n"
+               f"    fill_random(A,N*N); fill_random(B,N*N);")
+    cleanup = "cudaFree(A); cudaFree(B); cudaFree(C);"
     return kernel + BENCHMARK_MAIN.format(
-        naive_header=_NAIVE_HEADER,
-        variant_tag=tag,
-        setup_code=setup,
-        launch_ref=ref_launch,
-        kernel_launch=launch,
-        correctness_block=check,
-        cleanup_code=cleanup,
+        variant_tag=tag, setup_code=setup,
+        kernel_launch=launch, cleanup_code=cleanup,
     )
 
 
-def generate_reduction(params: dict) -> str:
-    body   = _reduction_body(params["warp_shuffle"])
+def generate_reduction(params: dict, matrix_size: int = 1024,
+                       with_correctness: bool = False) -> str:
+    """Generate a complete reduction variant .cu file."""
+    body   = _reduction_body(params["block_size"], params["warp_shuffle"])
     kernel = REDUCTION_TEMPLATE.format(reduce_body=body, **params)
 
-    N    = 1 << 20
-    blk  = params["block_size"]
-    tag  = _variant_tag("reduction", params)
+    blk = params["block_size"]
+    tag = _variant_tag("reduction", params)
 
-    # Optimized kernel: grid covers N with double-loading, so blocks = N/(blk*2)
-    launch     = f"reduction_opt<<<grid_opt, {blk}, {blk}*sizeof(float)>>>(in, d_out, N);"
-    # Naive reference: single-load per thread, block size 256
-    ref_launch = "launch_reduction_naive(in, d_ref, N, 256);"
+    if with_correctness:
+        N = 1 << 20
+        setup = (
+            f"int N = {N};\n"
+            f"    int grid_opt = (N + {blk}*2 - 1) / ({blk}*2);\n"
+            f"    int grid_ref = (N + 256 - 1) / 256;\n"
+            f"    float *in, *d_out, *d_ref;\n"
+            f"    CUDA_CHECK(cudaMalloc(&in,    N*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&d_out, grid_opt*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&d_ref, grid_ref*sizeof(float)));\n"
+            f"    fill_random(in, N);"
+        )
+        cleanup    = "cudaFree(in); cudaFree(d_out); cudaFree(d_ref);"
+        launch     = (f"reduction_opt<<<grid_opt, {blk}, "
+                      f"{blk}*sizeof(float)>>>(in, d_out, N);")
+        ref_launch = "launch_reduction_naive(in, d_ref, N, 256);"
+        check      = _scalar_sum_check_block("grid_opt", "grid_ref", tag)
+        return kernel + BENCHMARK_MAIN_WITH_CORRECTNESS.format(
+            naive_header=_NAIVE_HEADER,
+            variant_tag=tag,
+            setup_code=setup,
+            launch_ref=ref_launch,
+            kernel_launch=launch,
+            correctness_block=check,
+            cleanup_code=cleanup,
+        )
 
-    setup = (
-        f"int N = {N};\n"
-        f"    int grid_opt = (N + {blk}*2 - 1) / ({blk}*2);\n"
-        f"    int grid_ref = (N + 256 - 1) / 256;\n"
-        f"    float *in, *d_out, *d_ref;\n"
-        f"    CUDA_CHECK(cudaMalloc(&in,    N*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&d_out, grid_opt*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&d_ref, grid_ref*sizeof(float)));\n"
-        f"    fill_random(in, N);"
-    )
-    cleanup = "cudaFree(in); cudaFree(d_out); cudaFree(d_ref);"
-    check   = _scalar_sum_check_block("grid_opt", "grid_ref", tag)
-
+    N = matrix_size * 1024  # keep large regardless of matrix_size scale
+    setup   = (f"int N={N}; int grid=(N+{blk*2}-1)/({blk*2});\n"
+               f"    float *in,*out;\n"
+               f"    CUDA_CHECK(cudaMalloc(&in,N*4));\n"
+               f"    CUDA_CHECK(cudaMalloc(&out,grid*4));\n"
+               f"    fill_random(in,N);")
+    launch  = f"reduction_opt<<<grid,{blk},{blk}*4>>>(in,out,N);"
+    cleanup = "cudaFree(in); cudaFree(out);"
     return kernel + BENCHMARK_MAIN.format(
-        naive_header=_NAIVE_HEADER,
-        variant_tag=tag,
-        setup_code=setup,
-        launch_ref=ref_launch,
-        kernel_launch=launch,
-        correctness_block=check,
-        cleanup_code=cleanup,
+        variant_tag=tag, setup_code=setup,
+        kernel_launch=launch, cleanup_code=cleanup,
     )
 
 
-def generate_softmax(params: dict) -> str:
+def generate_softmax(params: dict, matrix_size: int = 1024,
+                     with_correctness: bool = False) -> str:
+    """Generate a complete softmax variant .cu file."""
     kernel = SOFTMAX_TEMPLATE.format(**params)
 
-    rows = 1024; cols = 4096
-    blk  = params["block_size"]
-    tag  = _variant_tag("softmax", params)
+    blk = params["block_size"]
+    tag = _variant_tag("softmax", params)
 
-    launch     = f"softmax_opt<<<rows, {blk}, {blk}*sizeof(float)>>>(in, d_out, rows, cols);"
-    ref_launch = "launch_softmax_naive(in, d_ref, rows, cols);"
+    if with_correctness:
+        rows, cols = 1024, 4096
+        setup = (
+            f"int rows = {rows}, cols = {cols};\n"
+            f"    float *in, *d_out, *d_ref;\n"
+            f"    CUDA_CHECK(cudaMalloc(&in,    rows*cols*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&d_out, rows*cols*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&d_ref, rows*cols*sizeof(float)));\n"
+            f"    fill_random(in, rows*cols);"
+        )
+        cleanup    = "cudaFree(in); cudaFree(d_out); cudaFree(d_ref);"
+        launch     = (f"softmax_opt<<<rows, {blk}, "
+                      f"{blk}*sizeof(float)>>>(in, d_out, rows, cols);")
+        ref_launch = "launch_softmax_naive(in, d_ref, rows, cols);"
+        check      = _elementwise_check_block("rows*cols", tag)
+        return kernel + BENCHMARK_MAIN_WITH_CORRECTNESS.format(
+            naive_header=_NAIVE_HEADER,
+            variant_tag=tag,
+            setup_code=setup,
+            launch_ref=ref_launch,
+            kernel_launch=launch,
+            correctness_block=check,
+            cleanup_code=cleanup,
+        )
 
-    setup = (
-        f"int rows = {rows}, cols = {cols};\n"
-        f"    float *in, *d_out, *d_ref;\n"
-        f"    CUDA_CHECK(cudaMalloc(&in,    rows*cols*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&d_out, rows*cols*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&d_ref, rows*cols*sizeof(float)));\n"
-        f"    fill_random(in, rows*cols);"
-    )
-    cleanup = "cudaFree(in); cudaFree(d_out); cudaFree(d_ref);"
-    check   = _elementwise_check_block("rows*cols", tag)
-
+    rows, cols = matrix_size, 4096
+    setup   = (f"int rows={rows},cols={cols}; float *in,*out;\n"
+               f"    CUDA_CHECK(cudaMalloc(&in,rows*cols*4));\n"
+               f"    CUDA_CHECK(cudaMalloc(&out,rows*cols*4));\n"
+               f"    fill_random(in,rows*cols);")
+    launch  = f"softmax_opt<<<rows,{blk},{blk}*4>>>(in,out,rows,cols);"
+    cleanup = "cudaFree(in); cudaFree(out);"
     return kernel + BENCHMARK_MAIN.format(
-        naive_header=_NAIVE_HEADER,
-        variant_tag=tag,
-        setup_code=setup,
-        launch_ref=ref_launch,
-        kernel_launch=launch,
-        correctness_block=check,
-        cleanup_code=cleanup,
+        variant_tag=tag, setup_code=setup,
+        kernel_launch=launch, cleanup_code=cleanup,
     )
 
 
-def generate_layernorm(params: dict) -> str:
-    kernel = LAYERNORM_TEMPLATE.format(**params)
+def generate_layernorm(params: dict, matrix_size: int = 1024,
+                       with_correctness: bool = False,
+                       single_pass: bool = False) -> str:
+    """
+    Generate a complete layernorm variant .cu file.
 
-    rows = 512; cols = 2048
-    blk  = params["block_size"]
-    tag  = _variant_tag("layernorm", params)
+    Args:
+        single_pass: If True, use the Phase-B single-pass template
+                     (sum + sum-of-squares accumulated in parallel).
+                     Otherwise the three-pass (mean → var → norm) template.
+    """
+    template = LAYERNORM_SINGLEPASS_TEMPLATE if single_pass else LAYERNORM_TEMPLATE
+    kernel   = template.format(**params)
 
-    launch = (f"layernorm_opt<<<rows, {blk}, 2*{blk}*sizeof(float)>>>"
-              f"(in, d_out, gamma, beta, rows, cols, 1e-5f);")
-    ref_launch = "launch_layernorm_naive(in, d_ref, gamma, beta, rows, cols);"
+    blk = params["block_size"]
+    tag = _variant_tag("layernorm", params)
 
-    setup = (
-        f"int rows = {rows}, cols = {cols};\n"
-        f"    float *in, *d_out, *d_ref, *gamma, *beta;\n"
-        f"    CUDA_CHECK(cudaMalloc(&in,    rows*cols*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&d_out, rows*cols*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&d_ref, rows*cols*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&gamma, cols*sizeof(float)));\n"
-        f"    CUDA_CHECK(cudaMalloc(&beta,  cols*sizeof(float)));\n"
-        f"    fill_random(in, rows*cols);\n"
-        f"    fill_random(gamma, cols);\n"
-        f"    fill_random(beta, cols);"
-    )
-    cleanup = ("cudaFree(in); cudaFree(d_out); cudaFree(d_ref); "
-               "cudaFree(gamma); cudaFree(beta);")
-    check   = _elementwise_check_block("rows*cols", tag)
+    if with_correctness:
+        rows, cols = 512, 2048
+        smem_words = 2 * blk if single_pass else blk
+        setup = (
+            f"int rows = {rows}, cols = {cols};\n"
+            f"    float *in, *d_out, *d_ref, *gamma, *beta;\n"
+            f"    CUDA_CHECK(cudaMalloc(&in,    rows*cols*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&d_out, rows*cols*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&d_ref, rows*cols*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&gamma, cols*sizeof(float)));\n"
+            f"    CUDA_CHECK(cudaMalloc(&beta,  cols*sizeof(float)));\n"
+            f"    fill_random(in, rows*cols);\n"
+            f"    fill_random(gamma, cols);\n"
+            f"    fill_random(beta, cols);"
+        )
+        cleanup = ("cudaFree(in); cudaFree(d_out); cudaFree(d_ref); "
+                   "cudaFree(gamma); cudaFree(beta);")
+        launch = (f"layernorm_opt<<<rows, {blk}, "
+                  f"{smem_words}*sizeof(float)>>>"
+                  f"(in, d_out, gamma, beta, rows, cols, 1e-5f);")
+        ref_launch = "launch_layernorm_naive(in, d_ref, gamma, beta, rows, cols);"
+        check      = _elementwise_check_block("rows*cols", tag)
+        return kernel + BENCHMARK_MAIN_WITH_CORRECTNESS.format(
+            naive_header=_NAIVE_HEADER,
+            variant_tag=tag,
+            setup_code=setup,
+            launch_ref=ref_launch,
+            kernel_launch=launch,
+            correctness_block=check,
+            cleanup_code=cleanup,
+        )
 
+    rows, cols = matrix_size // 2, 2048
+    setup   = (f"int rows={rows},cols={cols}; float *in,*out,*gamma,*beta;\n"
+               f"    CUDA_CHECK(cudaMalloc(&in,rows*cols*4));\n"
+               f"    CUDA_CHECK(cudaMalloc(&out,rows*cols*4));\n"
+               f"    CUDA_CHECK(cudaMalloc(&gamma,cols*4));\n"
+               f"    CUDA_CHECK(cudaMalloc(&beta,cols*4));\n"
+               f"    fill_random(in,rows*cols);\n"
+               f"    fill_ones(gamma,cols);\n"
+               f"    CUDA_CHECK(cudaMemset(beta,0,cols*4));")
+    launch  = f"layernorm_opt<<<rows,{blk},{blk}*4>>>(in,out,gamma,beta,rows,cols,1e-5f);"
+    cleanup = "cudaFree(in); cudaFree(out); cudaFree(gamma); cudaFree(beta);"
     return kernel + BENCHMARK_MAIN.format(
-        naive_header=_NAIVE_HEADER,
-        variant_tag=tag,
-        setup_code=setup,
-        launch_ref=ref_launch,
-        kernel_launch=launch,
-        correctness_block=check,
-        cleanup_code=cleanup,
+        variant_tag=tag, setup_code=setup,
+        kernel_launch=launch, cleanup_code=cleanup,
     )
-
-
-def _variant_tag(kernel: str, params: dict) -> str:
-    parts = [kernel]
-    for k, v in sorted(params.items()):
-        parts.append(f"{k}{v}")
-    return "_".join(str(p) for p in parts)
 
 
 GENERATORS = {
@@ -610,30 +832,34 @@ GENERATORS = {
 }
 
 
+# ── Variant enumeration ───────────────────────────────────────────────────
+
 def enumerate_variants(kernel: str, space: dict) -> list[tuple[dict, Path]]:
     """
-    Expand the search space into a list of (params, output_path) tuples,
-    pruning invalid combinations.
+    Expand the search space into a list of (params, output_path) tuples.
+
+    Applies kernel-specific validity pruning (e.g. square tiles for matmul,
+    transpose_b deduplication for register-blocked matmul).
     """
     param_keys = [k for k in space if not k.startswith("_")]
     param_vals = [space[k] for k in param_keys]
 
-    variants = []
+    variants:  list[tuple[dict, Path]] = []
     seen_tags: set[str] = set()
 
     for combo in itertools.product(*param_vals):
         params = dict(zip(param_keys, combo))
 
         if kernel == "matmul":
-            rt = params.get("reg_tile", 1)
-            # Matmul always uses square tiles — tile_x drives the 2D block side.
+            # Matmul always uses square tiles.
             if params.get("tile_x") != params.get("tile_y"):
                 continue
-            if rt > 1:
-                # transpose_b is meaningless in the regblock template (B is
-                # loaded column-by-column anyway); drop those duplicates.
-                if params.get("transpose_b", False):
-                    continue
+            if params.get("tile_x", 0) > params.get("block_size", 256):
+                continue
+            # transpose_b is meaningless in the regblock template
+            # (B is loaded column-by-column anyway); drop those duplicates.
+            if params.get("reg_tile", 1) > 1 and params.get("transpose_b", False):
+                continue
 
         tag = _variant_tag(kernel, params)
         if tag in seen_tags:
@@ -646,13 +872,29 @@ def enumerate_variants(kernel: str, space: dict) -> list[tuple[dict, Path]]:
     return variants
 
 
-def write_variant(kernel: str, params: dict, out_path: Path) -> None:
+def write_variant(kernel: str, params: dict, out_path: Path,
+                  matrix_size: int = 1024,
+                  with_correctness: bool = False) -> None:
+    """
+    Write a generated .cu file for the given kernel and parameters.
+
+    Args:
+        kernel:           Kernel name.
+        params:           Parameter dict.
+        out_path:         Destination path for the generated file.
+        matrix_size:      Override problem size (N for matmul, rows for
+                          softmax/layernorm).
+        with_correctness: If True, emit the Phase-B driver that runs the
+                          naive reference kernel and prints a CHECK line.
+    """
     gen = GENERATORS.get(kernel)
     if gen is None:
-        raise ValueError(f"No generator for kernel '{kernel}'")
-    src = gen(params)
+        raise ValueError(f"No generator for kernel {kernel!r}")
+    src = gen(params, matrix_size=matrix_size, with_correctness=with_correctness)
     out_path.write_text(src, encoding="utf-8")
 
+
+# ── CLI ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
@@ -666,11 +908,10 @@ if __name__ == "__main__":
         memory=MemoryAccessPattern(
             has_strided_access=(kernel == "matmul"),
             has_reduction=(kernel in ("reduction", "softmax")),
-        )
+        ),
     )
     space    = build_search_space(dummy)
     variants = enumerate_variants(kernel, space)
-
     print(f"Kernel: {kernel}  →  {len(variants)} variants")
     for params, path in variants[:3]:
         write_variant(kernel, params, path)

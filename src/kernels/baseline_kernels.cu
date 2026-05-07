@@ -142,6 +142,45 @@ __global__ void layernorm_naive(const float* __restrict__ input,
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
+ * 5. MULTI-HEAD ATTENTION — naive single-threaded per query row
+ *    Issues: all S*D dot products serialized, no shared memory reuse,
+ *            O(S²) softmax stored fully before output accumulation
+ * ───────────────────────────────────────────────────────────────────────── */
+__global__ void attention_naive(const float* __restrict__ Q,
+                                const float* __restrict__ K,
+                                const float* __restrict__ V,
+                                float* __restrict__ O,
+                                int S, int D, float scale)
+{
+    extern __shared__ float scores[];   /* S floats per block */
+    int row = blockIdx.x;
+    if (row >= S) return;
+    if (threadIdx.x != 0) return;      /* single-threaded per row baseline */
+
+    /* Phase 1: compute S attention scores for this query row */
+    for (int j = 0; j < S; ++j) {
+        float dot = 0.0f;
+        for (int d = 0; d < D; ++d)
+            dot += Q[row*D+d] * K[j*D+d];
+        scores[j] = dot * scale;
+    }
+
+    /* Phase 2: numerically stable softmax */
+    float max_v = scores[0];
+    for (int j = 1; j < S; ++j) max_v = fmaxf(max_v, scores[j]);
+    float sum = 0.0f;
+    for (int j = 0; j < S; ++j) { scores[j] = expf(scores[j] - max_v); sum += scores[j]; }
+    for (int j = 0; j < S; ++j) scores[j] /= sum;
+
+    /* Phase 3: weighted sum over V */
+    for (int d = 0; d < D; ++d) {
+        float acc = 0.0f;
+        for (int j = 0; j < S; ++j) acc += scores[j] * V[j*D+d];
+        O[row*D+d] = acc;
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
  * Host-side launcher helpers (called by benchmark harness)
  * ───────────────────────────────────────────────────────────────────────── */
 
@@ -221,6 +260,36 @@ float launch_reduction(float* d_in, float* d_out, int N,
 
     for (int i = 0; i < iters; ++i)
         reduction_naive<<<grid_size, block_size, smem>>>(d_in, d_out, N);
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return ms / iters;
+}
+
+float launch_attention(float* d_Q, float* d_K, float* d_V, float* d_O,
+                       int S, int D, int warmup, int iters)
+{
+    float scale = 1.0f / sqrtf((float)D);
+    size_t smem  = S * sizeof(float);
+    dim3 grid(S);
+    dim3 block(1);
+
+    for (int i = 0; i < warmup; ++i)
+        attention_naive<<<grid, block, smem>>>(d_Q, d_K, d_V, d_O, S, D, scale);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+
+    for (int i = 0; i < iters; ++i)
+        attention_naive<<<grid, block, smem>>>(d_Q, d_K, d_V, d_O, S, D, scale);
 
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
