@@ -26,6 +26,21 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+# Compiler Design Components (Unit I-VI)
+try:
+    from cdc.frontend import run_frontend
+    from cdc.ir import emit_tac, partition_blocks, build_cfg, build_dag
+    from cdc.ir.basic_block import format_blocks
+    from cdc.ir.dag import format_dag
+    from cdc.opt.dfa import LiveVariables, ReachingDefsSolver, AvailableExpressions, solve, format_dfa_result, collect_universe
+    from cdc.opt import constant_propagation, common_subexpression_elimination, dead_code_elimination, loop_invariant_code_motion, strength_reduction
+    from cdc.opt.register_pressure import estimate_register_pressure, format_report as format_rp_report
+    from cdc.first_follow import build_example_grammar, compute_nullable, compute_first, compute_follow, build_ll1_table, format_first_follow, format_ll1_table
+    CDC_AVAILABLE = True
+except ImportError as e:
+    CDC_AVAILABLE = False
+    CDC_ERROR = str(e)
+
 # ── Config ─────────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -1221,10 +1236,178 @@ KERNEL_META = {
     "attention": {"icon": "🧠", "label": "Attention",        "color": "#ec4899"},
 }
 
-tab_labels = [f"{m['icon']} {m['label']}" for m in KERNEL_META.values()] + ["📈 Compare All"]
+tab_labels = ["🔨 Compiler Pipeline"] + [f"{m['icon']} {m['label']}" for m in KERNEL_META.values()] + ["📈 Compare All"]
 tabs       = st.tabs(tab_labels)
 
-for tab_widget, (kernel, meta) in zip(tabs, KERNEL_META.items()):
+# ── Compiler Pipeline Tab (Unit I-VI) ──────────────────────────────────────
+with tabs[0]:
+    st.markdown("## 🔨 Compiler Design Pipeline: CUDA C Subset")
+    st.markdown("**Interactive demonstration of all compiler phases**: Lexical Analysis → Syntax Analysis → Semantic Analysis → Intermediate Code Generation → Code Generation → Optimization")
+
+    if not CDC_AVAILABLE:
+        st.error(f"CDC modules not available: {CDC_ERROR}")
+    else:
+        # Kernel selector
+        kernel_name = st.selectbox("Select kernel to compile", list(KERNEL_META.keys()), key="cd_kernel_selector")
+
+        # Create subtabs for each phase
+        phase_tabs = st.tabs(["📝 Frontend (Phase 1)", "🔀 IR (Phase 2)", "⚙️  Optimization (Phase 3)", "📊 Parse Table"])
+
+        # Load source file
+        src_file = ROOT / "src" / "kernels" / "baseline_kernels.cu"
+        if not src_file.exists():
+            st.error(f"Source file not found: {src_file}")
+        else:
+            # Run frontend to extract kernels
+            try:
+                frontend_result = run_frontend(src_file)
+                kernel_obj = frontend_result.by_name(kernel_name)
+
+                if not kernel_obj:
+                    st.error(f"Kernel '{kernel_name}' not found in source")
+                elif not kernel_obj.ok():
+                    st.error(f"Frontend errors in {kernel_name}: {[d.message for d in kernel_obj.diagnostics]}")
+                else:
+                    # ── Phase 1: Frontend ──────────────────────────────────────
+                    with phase_tabs[0]:
+                        st.write("### Lexical Analysis (Tokens)")
+                        tokens_list = []
+                        from cdc.preprocessor import preprocess
+                        from cdc.lexer import tokenize
+                        cleaned = preprocess(kernel_obj.source)
+                        for tok in tokenize(cleaned):
+                            tokens_list.append({"Line": tok.lineno, "Type": tok.type, "Value": repr(tok.value)})
+                        if tokens_list:
+                            st.dataframe(pd.DataFrame(tokens_list), use_container_width=True)
+
+                        st.divider()
+                        st.write("### Syntax Analysis (AST)")
+                        from cdc.ast_nodes import pretty
+                        st.code(pretty(kernel_obj.ast), language="text")
+
+                        st.divider()
+                        st.write("### Symbol Table")
+                        symtab_rows = []
+                        for scope in kernel_obj.scopes:
+                            for sym in scope.symbols.values():
+                                symtab_rows.append({
+                                    "Name": sym.name,
+                                    "Type": str(sym.type),
+                                    "Kind": sym.kind,
+                                    "Scope": scope.level,
+                                })
+                        if symtab_rows:
+                            st.dataframe(pd.DataFrame(symtab_rows), use_container_width=True)
+
+                        st.divider()
+                        st.write("### Type Diagnostics")
+                        if kernel_obj.diagnostics:
+                            for d in kernel_obj.diagnostics:
+                                if "error" in d.severity.lower():
+                                    st.error(f"Line {d.line}: {d.message}")
+                                elif "warning" in d.severity.lower():
+                                    st.warning(f"Line {d.line}: {d.message}")
+                        else:
+                            st.success("✓ No type errors or warnings")
+
+                    # ── Phase 2: Intermediate Representation ──────────────────
+                    with phase_tabs[1]:
+                        prog = emit_tac(kernel_obj.ast)
+                        blocks = partition_blocks(prog)
+                        cfg = build_cfg(blocks)
+
+                        st.write("### Three-Address Code (TAC / Quadruples)")
+                        tac_rows = []
+                        for i, quad in enumerate(prog.quads):
+                            tac_rows.append({
+                                "#": i,
+                                "Op": quad.op,
+                                "Arg1": quad.arg1 or "—",
+                                "Arg2": quad.arg2 or "—",
+                                "Result": quad.result or "—",
+                            })
+                        st.dataframe(pd.DataFrame(tac_rows), use_container_width=True)
+
+                        st.divider()
+                        st.write("### Basic Blocks")
+                        for bb in blocks:
+                            with st.expander(f"Block {bb.id} ({len(bb.quads)} quads)"):
+                                bb_rows = []
+                                for i, quad in enumerate(bb.quads):
+                                    bb_rows.append({"#": i, "Quad": str(quad)})
+                                st.dataframe(pd.DataFrame(bb_rows), use_container_width=True)
+
+                        st.divider()
+                        st.write("### Control Flow Graph (CFG)")
+                        st.text(cfg.format_edges())
+                        st.divider()
+                        st.text(cfg.format_dominators())
+
+                    # ── Phase 3: Optimization ──────────────────────────────────
+                    with phase_tabs[2]:
+                        st.write("### Data Flow Analysis")
+
+                        # Live Variables
+                        lv = LiveVariables()
+                        in_l, out_l = solve(cfg, lv)
+                        st.text(format_dfa_result("Live Variables (backward, union)", in_l, out_l, cfg))
+
+                        st.divider()
+
+                        st.write("### Optimization Passes")
+                        cp_stats = constant_propagation(prog, blocks)
+                        cse_stats = common_subexpression_elimination(blocks)
+                        sr_stats = strength_reduction(blocks)
+                        licm_stats = loop_invariant_code_motion(blocks, cfg)
+                        dce_stats = dead_code_elimination(blocks, cfg)
+
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Const Propagation", f"{cp_stats['folded']} folded")
+                        with col2:
+                            st.metric("CSE", f"{cse_stats['eliminated']} eliminated")
+                        with col3:
+                            st.metric("Strength Reduction", f"{sr_stats['rewritten']} rewritten")
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("LICM", f"{licm_stats['hoisted']} hoisted")
+                        with col2:
+                            st.metric("DCE", f"{dce_stats['removed']} removed")
+
+                        st.divider()
+                        st.write("### Register Pressure")
+                        try:
+                            rp = estimate_register_pressure(kernel_name, blocks, cfg)
+                            st.text(format_rp_report(rp))
+                        except Exception as e:
+                            st.warning(f"Could not estimate register pressure: {e}")
+
+                    # ── LL(1) Parse Table ──────────────────────────────────────
+                    with phase_tabs[3]:
+                        st.write("### FIRST/FOLLOW Sets and LL(1) Parse Table")
+                        st.markdown("**Tutorial 5 / Lab Practical 7**: Compute FIRST/FOLLOW sets from grammar and construct LL(1) predictive parse table.")
+
+                        grammar = build_example_grammar()
+                        nullable = compute_nullable(grammar)
+                        first = compute_first(grammar, nullable)
+                        follow = compute_follow(grammar, first, nullable)
+
+                        st.text(format_first_follow(first, follow, grammar.non_terminals))
+
+                        st.divider()
+                        table = build_ll1_table(grammar, first, follow, nullable)
+                        st.text(format_ll1_table(table, grammar))
+
+                        st.info("ℹ️ This grammar is LL(1)-friendly for educational purposes. The actual LALR(1) parser resolves ambiguities using shift/reduce decisions.")
+
+            except Exception as e:
+                st.error(f"Error in compiler pipeline: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
+# ── Kernel-Specific Tabs ────────────────────────────────────────────────────
+for tab_widget, (kernel, meta) in zip(tabs[1:], KERNEL_META.items()):
     with tab_widget:
         results  = get_kernel_results(kernel)
         baseline = get_baseline()

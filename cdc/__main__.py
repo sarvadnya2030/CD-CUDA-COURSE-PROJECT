@@ -43,6 +43,10 @@ from .ir import (
 )
 from .ir.basic_block import format_blocks
 from .ir.dag import format_dag
+from .first_follow import (
+    build_example_grammar, compute_nullable, compute_first,
+    compute_follow, build_ll1_table, format_first_follow, format_ll1_table,
+)
 
 
 def _phase2_for_kernel(k, opts) -> str:
@@ -190,6 +194,11 @@ def main(argv=None) -> int:
     p.add_argument("--regs", action="store_true",
                    help="Estimate register pressure from live-variable analysis")
 
+    # Unit III: FIRST/FOLLOW (Tutorial 5, Lab Practical 7)
+    p.add_argument("--first-follow", action="store_true",
+                   help="Compute and display FIRST/FOLLOW sets and LL(1) parse table "
+                        "(Unit III: LL(1) parser construction)")
+
     p.add_argument("--kernel", type=str, default=None,
                    help="Only emit phase output for the named kernel")
 
@@ -204,6 +213,18 @@ def main(argv=None) -> int:
         cleaned = preprocess(src)
         for tok in tokenize(cleaned):
             print(f"{tok.lineno:>4}: {tok.type:<14} {tok.value!r}")
+        return 0
+
+    # Unit III: FIRST/FOLLOW
+    if args.first_follow:
+        grammar = build_example_grammar()
+        nullable = compute_nullable(grammar)
+        first = compute_first(grammar, nullable)
+        follow = compute_follow(grammar, first, nullable)
+        print(format_first_follow(first, follow, grammar.non_terminals))
+        print()
+        table = build_ll1_table(grammar, first, follow, nullable)
+        print(format_ll1_table(table, grammar))
         return 0
 
     # Always run the frontend (every other phase needs the AST).
