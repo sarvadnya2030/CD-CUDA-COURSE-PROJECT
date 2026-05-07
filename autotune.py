@@ -773,11 +773,22 @@ Examples:
         help="Phase 2: emit TAC + basic blocks + CFG + DAG for every kernel "
              "after the frontend pass.  Equivalent to: python -m cdc <file> --ir"
     )
+    parser.add_argument(
+        "--cdc-opt", action="store_true",
+        help="Phase 3: run all classical optimisation passes (const-prop, "
+             "CSE, DCE, LICM, strength reduction) and print stats per kernel"
+    )
+    parser.add_argument(
+        "--cdc-regs", action="store_true",
+        help="Phase 3: estimate per-kernel register pressure from live-vars "
+             "and feed the auto-tuner's tile/unroll cost model"
+    )
 
     args = parser.parse_args()
 
     # ── CDC frontend (Phase 1) ─────────────────────────────────────────
-    if args.cdc_frontend or args.cdc_frontend_only or args.cdc_ir:
+    if args.cdc_frontend or args.cdc_frontend_only or args.cdc_ir \
+       or args.cdc_opt or args.cdc_regs:
         try:
             from cdc.frontend import run_frontend, format_report
             kernels_cu = Path(__file__).parent / "src" / "kernels" / "baseline_kernels.cu"
@@ -795,26 +806,81 @@ Examples:
                 return
 
         # Phase 2: TAC + basic blocks + CFG + DAG
-        if args.cdc_ir:
+        if args.cdc_ir or args.cdc_opt or args.cdc_regs:
             try:
                 from cdc.ir import emit_tac, partition_blocks, build_cfg, build_dag
-                print("[CDC] running IR pipeline (TAC -> BB -> CFG -> DAG) ...")
-                for k in result.kernels:
-                    prog = emit_tac(k.ast)
-                    blocks = partition_blocks(prog)
-                    cfg = build_cfg(blocks)
-                    n_dag = sum(len(build_dag(b)) for b in blocks)
-                    n_edges = sum(len(s) for s in cfg.succ.values())
-                    print(f"  {k.name:<20} "
-                          f"quads={len(prog.quads):>3}  "
-                          f"BBs={len(blocks):>2}  "
-                          f"edges={n_edges:>2}  "
-                          f"DAG-nodes={n_dag:>3}")
-                print()
-                print("[CDC] use 'python -m cdc <file.cu> --ir' for full per-kernel output.")
-                print()
+                if args.cdc_ir:
+                    print("[CDC] running IR pipeline (TAC -> BB -> CFG -> DAG) ...")
+                    for k in result.kernels:
+                        prog = emit_tac(k.ast)
+                        blocks = partition_blocks(prog)
+                        cfg = build_cfg(blocks)
+                        n_dag = sum(len(build_dag(b)) for b in blocks)
+                        n_edges = sum(len(s) for s in cfg.succ.values())
+                        print(f"  {k.name:<20} "
+                              f"quads={len(prog.quads):>3}  "
+                              f"BBs={len(blocks):>2}  "
+                              f"edges={n_edges:>2}  "
+                              f"DAG-nodes={n_dag:>3}")
+                    print()
             except Exception as e:
                 print(f"[CDC] IR pipeline failed: {e}")
+
+        # Phase 3: optimisation passes + register-pressure cost model
+        if args.cdc_opt or args.cdc_regs:
+            try:
+                from cdc.ir import emit_tac, partition_blocks, build_cfg
+                from cdc.opt import (
+                    constant_propagation, common_subexpression_elimination,
+                    dead_code_elimination, loop_invariant_code_motion,
+                    strength_reduction, estimate_register_pressure,
+                )
+                if args.cdc_opt:
+                    print("[CDC] running optimisation passes "
+                          "(const-prop / CSE / strength / LICM / DCE) ...")
+                    print(f"  {'kernel':<20} "
+                          f"{'fold':>4} {'prop':>4} {'CSE':>4} {'DCE':>4} "
+                          f"{'sr':>4} {'loops':>5} {'hoist':>5}")
+                    for k in result.kernels:
+                        prog = emit_tac(k.ast)
+                        blocks = partition_blocks(prog)
+                        cfg = build_cfg(blocks)
+                        cp = constant_propagation(prog, blocks)
+                        cs = common_subexpression_elimination(blocks)
+                        sr = strength_reduction(blocks)
+                        lc = loop_invariant_code_motion(blocks, cfg)
+                        dc = dead_code_elimination(blocks, cfg)
+                        print(f"  {k.name:<20} "
+                              f"{cp['folded']:>4} {cp['propagated']:>4} "
+                              f"{cs['eliminated']:>4} {dc['removed']:>4} "
+                              f"{sr['rewritten']:>4} "
+                              f"{lc['loops_found']:>5} {lc['hoisted']:>5}")
+                    print()
+
+                if args.cdc_regs:
+                    print("[CDC] register-pressure cost model "
+                          "(live-vars -> tile/unroll budget) ...")
+                    print(f"  {'kernel':<20} {'max_live':>9} {'avg_live':>9} "
+                          f"{'sugg_unroll':>11} {'sugg_tile':>10}")
+                    for k in result.kernels:
+                        prog = emit_tac(k.ast)
+                        blocks = partition_blocks(prog)
+                        cfg = build_cfg(blocks)
+                        rp = estimate_register_pressure(k.name, blocks, cfg)
+                        print(f"  {rp.kernel:<20} "
+                              f"{rp.max_live:>9} "
+                              f"{rp.avg_live:>9.1f} "
+                              f"{rp.suggested_max_unroll:>11} "
+                              f"{rp.suggested_max_tile:>10}")
+                    print()
+
+                print("[CDC] use 'python -m cdc <file.cu> --opt --kernel <name>' "
+                      "for full TAC dumps.")
+                print()
+            except Exception as e:
+                import traceback
+                print(f"[CDC] opt pipeline failed: {e}")
+                traceback.print_exc()
 
         if args.cdc_frontend_only:
             return

@@ -46,7 +46,7 @@ from .ir.dag import format_dag
 
 
 def _phase2_for_kernel(k, opts) -> str:
-    """Render the requested Phase-2 outputs for one FrontendKernel."""
+    """Render the requested Phase-2 / Phase-3 outputs for one FrontendKernel."""
     out = []
     prog = emit_tac(k.ast)
 
@@ -88,6 +88,71 @@ def _phase2_for_kernel(k, opts) -> str:
             out.append(format_dag(nodes))
             out.append("")
 
+    # ── Phase 3 ─────────────────────────────────────────────────────────
+    if opts.dfa:
+        from .opt.dfa import (
+            LiveVariables, ReachingDefsSolver, AvailableExpressions,
+            collect_universe, solve, format_dfa_result,
+        )
+        out.append(f"== DFA: {k.name} ==")
+
+        lv = LiveVariables()
+        in_l, out_l = solve(cfg, lv)
+        out.append(format_dfa_result("Live Variables (backward, union)",
+                                     in_l, out_l, cfg))
+        out.append("")
+
+        rd = ReachingDefsSolver(cfg)
+        in_r, out_r = rd.solve()
+        # Convert (block_id, idx) tuples to short labels for display.
+        in_r_str  = {b: {f"BB{x[0]}.q{x[1]}" for x in v} for b, v in in_r.items()}
+        out_r_str = {b: {f"BB{x[0]}.q{x[1]}" for x in v} for b, v in out_r.items()}
+        out.append(format_dfa_result("Reaching Definitions (forward, union)",
+                                     in_r_str, out_r_str, cfg))
+        out.append("")
+
+        ae = AvailableExpressions()
+        ae.universe = collect_universe(cfg)
+        in_a, out_a = solve(cfg, ae)
+        out.append(format_dfa_result("Available Expressions (forward, intersect)",
+                                     in_a, out_a, cfg))
+        out.append("")
+
+    if opts.opt:
+        from .opt import (
+            constant_propagation, common_subexpression_elimination,
+            dead_code_elimination, loop_invariant_code_motion,
+            strength_reduction,
+        )
+        cp_stats   = constant_propagation(prog, blocks)
+        cse_stats  = common_subexpression_elimination(blocks)
+        sr_stats   = strength_reduction(blocks)
+        licm_stats = loop_invariant_code_motion(blocks, cfg)
+        dce_stats  = dead_code_elimination(blocks, cfg)
+        out.append(f"== Optimisation passes: {k.name} ==")
+        out.append(f"  constant folding   : {cp_stats['folded']:>3} folded, "
+                   f"{cp_stats['propagated']:>3} propagated")
+        out.append(f"  CSE                : {cse_stats['eliminated']:>3} eliminated")
+        out.append(f"  strength reduction : {sr_stats['rewritten']:>3} rewritten")
+        out.append(f"  LICM               : {licm_stats['loops_found']:>3} loops, "
+                   f"{licm_stats['invariants_identified']:>3} invariants, "
+                   f"{licm_stats['hoisted']:>3} hoisted")
+        out.append(f"  dead-code          : {dce_stats['removed']:>3} removed")
+        out.append("")
+        out.append("-- Optimised TAC --")
+        # Re-flatten prog after passes that mutated blocks.
+        prog.quads = [q for bb in blocks for q in bb.quads]
+        out.append(prog.numbered())
+        out.append("")
+
+    if opts.regs:
+        from .opt.register_pressure import (
+            estimate_register_pressure, format_report,
+        )
+        rp = estimate_register_pressure(k.name, blocks, cfg)
+        out.append(format_report(rp))
+        out.append("")
+
     return "\n".join(out).rstrip()
 
 
@@ -114,6 +179,16 @@ def main(argv=None) -> int:
     p.add_argument("--dag", action="store_true", help="Emit per-block DAG")
     p.add_argument("--ir", action="store_true",
                    help="Shorthand for --tac --bb --cfg --dag")
+
+    # Phase 3 flags
+    p.add_argument("--dfa", action="store_true",
+                   help="Run live-vars / reaching-defs / available-exprs analyses")
+    p.add_argument("--opt", action="store_true",
+                   help="Run all classical optimisation passes (const-prop, "
+                        "CSE, DCE, LICM, strength-reduction); print stats and "
+                        "the optimised TAC")
+    p.add_argument("--regs", action="store_true",
+                   help="Estimate register pressure from live-variable analysis")
 
     p.add_argument("--kernel", type=str, default=None,
                    help="Only emit phase output for the named kernel")
@@ -142,7 +217,8 @@ def main(argv=None) -> int:
             print(d)
         return 0 if res.ok() else 1
 
-    phase2 = args.tac or args.bb or args.cfg or args.dot or args.dag
+    phase2 = (args.tac or args.bb or args.cfg or args.dot or args.dag or
+              args.dfa or args.opt or args.regs)
     if phase2:
         for k in res.kernels:
             if args.kernel and k.name != args.kernel:
